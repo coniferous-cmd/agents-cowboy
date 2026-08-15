@@ -15,11 +15,26 @@ pub(crate) enum CommandMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ConfigCommand {
     List,
-    Create { name: String },
-    Edit { name: String },
-    Delete { name: String },
-    Activate { name: String },
+    Create {
+        name: String,
+    },
+    Edit {
+        name: String,
+    },
+    Delete {
+        name: String,
+    },
+    Activate {
+        name: String,
+    },
     History(HistoryCommand),
+    Bind {
+        project_path: String,
+        profile_name: String,
+    },
+    Unbind {
+        project_path: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cowboy::claude_env::{ClaudeEnvStore, ClaudeProfile, ClaudeSettingsSnapshot};
-use cowboy::domain::{Project, Session, SessionKey};
+use cowboy::domain::{Project, ProjectProfileBinding, Session, SessionKey};
 use cowboy::infrastructure::ClaudeProjectsStore;
 
 use crate::app::ResumeTarget;
@@ -31,6 +31,11 @@ pub trait ProfileRepository {
     fn create_snapshot(&self, profile_id: i64, settings_json: &str) -> AppResult<()>;
     fn update_profile_json(&self, name: &str, settings_json: &str) -> AppResult<ClaudeProfile>;
     fn delete_profile(&self, name: &str) -> AppResult<()>;
+    fn bind_profile(&self, project_cwd: &Path, profile_name: &str) -> AppResult<()>;
+    fn unbind_profile(&self, project_cwd: &Path) -> AppResult<()>;
+    fn project_binding(&self, project_cwd: &Path) -> AppResult<Option<ProjectProfileBinding>>;
+    #[allow(dead_code)]
+    fn profile_bindings(&self, profile_name: &str) -> AppResult<Vec<ProjectProfileBinding>>;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -70,6 +75,22 @@ impl ProfileRepository for NoProfileRepository {
     }
 
     fn delete_profile(&self, _name: &str) -> AppResult<()> {
+        Err("Profiles are unavailable".to_string())
+    }
+
+    fn bind_profile(&self, _project_cwd: &Path, _profile_name: &str) -> AppResult<()> {
+        Err("Profiles are unavailable".to_string())
+    }
+
+    fn unbind_profile(&self, _project_cwd: &Path) -> AppResult<()> {
+        Err("Profiles are unavailable".to_string())
+    }
+
+    fn project_binding(&self, _project_cwd: &Path) -> AppResult<Option<ProjectProfileBinding>> {
+        Err("Profiles are unavailable".to_string())
+    }
+
+    fn profile_bindings(&self, _profile_name: &str) -> AppResult<Vec<ProjectProfileBinding>> {
         Err("Profiles are unavailable".to_string())
     }
 }
@@ -155,6 +176,18 @@ where
     pub fn delete_profile(&self, name: &str) -> AppResult<()> {
         self.profiles.delete_profile(name)
     }
+
+    pub fn bind_profile(&self, project_cwd: &Path, profile_name: &str) -> AppResult<()> {
+        self.profiles.bind_profile(project_cwd, profile_name)
+    }
+
+    pub fn unbind_profile(&self, project_cwd: &Path) -> AppResult<()> {
+        self.profiles.unbind_profile(project_cwd)
+    }
+
+    pub fn project_binding(&self, project_cwd: &Path) -> AppResult<Option<ProjectProfileBinding>> {
+        self.profiles.project_binding(project_cwd)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -174,10 +207,21 @@ impl ResumeLauncher for ClaudeCliLauncher {
             .env_store
             .claude_command_alias()
             .map_err(|error| format!("Failed to read claude command alias: {error}"))?;
-        let status = Command::new(&command_name)
+        let mut command = Command::new(&command_name);
+        command
             .arg("--resume")
             .arg(&target.key.native_id)
-            .current_dir(&target.cwd)
+            .current_dir(&target.cwd);
+
+        if let Ok(Some(binding)) = self.env_store.project_binding(&target.cwd) {
+            if let Ok(profile_path) = self.env_store.profile_file_path(&binding.profile_name) {
+                if profile_path.exists() {
+                    command.arg("--settings").arg(&profile_path);
+                }
+            }
+        }
+
+        let status = command
             .status()
             .map_err(|error| format!("Failed to launch {command_name}: {error}"))?;
 
@@ -193,8 +237,18 @@ impl ResumeLauncher for ClaudeCliLauncher {
             .env_store
             .claude_command_alias()
             .map_err(|error| format!("Failed to read claude command alias: {error}"))?;
-        let status = Command::new(&command_name)
-            .current_dir(cwd)
+        let mut command = Command::new(&command_name);
+        command.current_dir(cwd);
+
+        if let Ok(Some(binding)) = self.env_store.project_binding(cwd) {
+            if let Ok(profile_path) = self.env_store.profile_file_path(&binding.profile_name) {
+                if profile_path.exists() {
+                    command.arg("--settings").arg(&profile_path);
+                }
+            }
+        }
+
+        let status = command
             .status()
             .map_err(|error| format!("Failed to launch {command_name}: {error}"))?;
 
@@ -307,5 +361,22 @@ impl ProfileRepository for ClaudeEnvStore {
 
     fn delete_profile(&self, name: &str) -> AppResult<()> {
         ClaudeEnvStore::delete_profile(self, name).map_err(|error| error.to_string())
+    }
+
+    fn bind_profile(&self, project_cwd: &Path, profile_name: &str) -> AppResult<()> {
+        ClaudeEnvStore::bind_profile(self, project_cwd, profile_name)
+            .map_err(|error| error.to_string())
+    }
+
+    fn unbind_profile(&self, project_cwd: &Path) -> AppResult<()> {
+        ClaudeEnvStore::unbind_profile(self, project_cwd).map_err(|error| error.to_string())
+    }
+
+    fn project_binding(&self, project_cwd: &Path) -> AppResult<Option<ProjectProfileBinding>> {
+        ClaudeEnvStore::project_binding(self, project_cwd).map_err(|error| error.to_string())
+    }
+
+    fn profile_bindings(&self, profile_name: &str) -> AppResult<Vec<ProjectProfileBinding>> {
+        ClaudeEnvStore::profile_bindings(self, profile_name).map_err(|error| error.to_string())
     }
 }

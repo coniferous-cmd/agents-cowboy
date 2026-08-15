@@ -1,4 +1,4 @@
-use crate::domain::{Result, StetsonError};
+use crate::domain::{ProjectProfileBinding, Result, StetsonError};
 use fs2::FileExt;
 use rusqlite::{params, OptionalExtension, Transaction};
 use sha2::{Digest, Sha256};
@@ -356,7 +356,7 @@ impl ClaudeEnvStore {
         replace_with_symlink(&link, target_file)
     }
 
-    fn profile_file_path(&self, name: &str) -> Result<PathBuf> {
+    pub fn profile_file_path(&self, name: &str) -> Result<PathBuf> {
         Ok(self.profiles_dir()?.join(format!("settings.{name}.json")))
     }
 
@@ -486,6 +486,75 @@ impl ClaudeEnvStore {
         self.connection()?
             .execute("DELETE FROM profile_activation_journal WHERE id=1", [])?;
         Ok(())
+    }
+
+    pub fn bind_profile(&self, project_cwd: &Path, profile_name: &str) -> Result<()> {
+        let profile_name = validate_profile_name(profile_name)?;
+        // Validate profile exists
+        let _ = self.profile(&profile_name)?;
+        let connection = self.connection()?;
+        let cwd_str = project_cwd.to_string_lossy();
+        match connection.execute(
+            "INSERT INTO project_profile_bindings (project_cwd, profile_name) VALUES (?1, ?2) \
+             ON CONFLICT(project_cwd) DO UPDATE SET profile_name=excluded.profile_name, \
+             created_at=CURRENT_TIMESTAMP",
+            params![cwd_str.as_ref(), profile_name],
+        ) {
+            Ok(_) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                Err(StetsonError::ProfileAlreadyBound(profile_name))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn unbind_profile(&self, project_cwd: &Path) -> Result<()> {
+        let connection = self.connection()?;
+        let cwd_str = project_cwd.to_string_lossy();
+        let changed = connection.execute(
+            "DELETE FROM project_profile_bindings WHERE project_cwd=?1",
+            [cwd_str.as_ref()],
+        )?;
+        if changed == 0 {
+            return Err(StetsonError::BindingNotFound(cwd_str.into_owned()));
+        }
+        Ok(())
+    }
+
+    pub fn project_binding(&self, project_cwd: &Path) -> Result<Option<ProjectProfileBinding>> {
+        let connection = self.connection()?;
+        let cwd_str = project_cwd.to_string_lossy();
+        let mut statement = connection.prepare(
+            "SELECT project_cwd, profile_name FROM project_profile_bindings WHERE project_cwd=?1",
+        )?;
+        let mut rows = statement.query_map([cwd_str.as_ref()], |row| {
+            Ok(ProjectProfileBinding {
+                project_cwd: PathBuf::from(row.get::<_, String>(0)?),
+                profile_name: row.get(1)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn profile_bindings(&self, profile_name: &str) -> Result<Vec<ProjectProfileBinding>> {
+        let profile_name = validate_profile_name(profile_name)?;
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT project_cwd, profile_name FROM project_profile_bindings WHERE profile_name=?1",
+        )?;
+        let rows = statement.query_map([&profile_name], |row| {
+            Ok(ProjectProfileBinding {
+                project_cwd: PathBuf::from(row.get::<_, String>(0)?),
+                profile_name: row.get(1)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     fn activation_lock(&self) -> Result<ActivationLock> {
@@ -1503,6 +1572,118 @@ mod tests {
         assert_eq!(
             fs::metadata(&target).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+    }
+
+    // ── project_profile_bindings tests ───────────────────────────────────
+
+    #[test]
+    fn bind_profile_creates_binding_and_query_returns_it() {
+        let (store, _temp, _) = store();
+        store.create_profile("work").unwrap();
+        let cwd = PathBuf::from("/work/my-project");
+
+        store.bind_profile(&cwd, "work").unwrap();
+
+        let binding = store.project_binding(&cwd).unwrap();
+        assert_eq!(binding.as_ref().unwrap().profile_name, "work");
+        assert_eq!(binding.unwrap().project_cwd, cwd);
+    }
+
+    #[test]
+    fn bind_profile_rejects_nonexistent_profile() {
+        let (store, _temp, _) = store();
+        let cwd = PathBuf::from("/work/my-project");
+
+        let result = store.bind_profile(&cwd, "nonexistent");
+        assert!(matches!(result, Err(StetsonError::ProfileNotFound(_))));
+    }
+
+    #[test]
+    fn bind_profile_upserts_binding_for_same_project() {
+        let (store, _temp, _) = store();
+        store.create_profile("work").unwrap();
+        store.create_profile("home").unwrap();
+        let cwd = PathBuf::from("/work/my-project");
+
+        store.bind_profile(&cwd, "work").unwrap();
+        store.bind_profile(&cwd, "home").unwrap();
+
+        let binding = store.project_binding(&cwd).unwrap().unwrap();
+        assert_eq!(binding.profile_name, "home");
+    }
+
+    #[test]
+    fn unbind_profile_removes_binding() {
+        let (store, _temp, _) = store();
+        store.create_profile("work").unwrap();
+        let cwd = PathBuf::from("/work/my-project");
+        store.bind_profile(&cwd, "work").unwrap();
+
+        store.unbind_profile(&cwd).unwrap();
+
+        assert!(store.project_binding(&cwd).unwrap().is_none());
+    }
+
+    #[test]
+    fn unbind_profile_errors_when_no_binding() {
+        let (store, _temp, _) = store();
+        let cwd = PathBuf::from("/work/my-project");
+
+        let result = store.unbind_profile(&cwd);
+        assert!(matches!(result, Err(StetsonError::BindingNotFound(_))));
+    }
+
+    #[test]
+    fn profile_bindings_returns_binding_for_bound_profile() {
+        let (store, _temp, _) = store();
+        store.create_profile("work").unwrap();
+        let cwd = PathBuf::from("/work/project-a");
+        store.bind_profile(&cwd, "work").unwrap();
+
+        let bindings = store.profile_bindings("work").unwrap();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].project_cwd, cwd);
+        assert_eq!(bindings[0].profile_name, "work");
+    }
+
+    #[test]
+    fn profile_bindings_returns_empty_for_unbound_profile() {
+        let (store, _temp, _) = store();
+        store.create_profile("work").unwrap();
+
+        let bindings = store.profile_bindings("work").unwrap();
+        assert!(bindings.is_empty());
+    }
+
+    #[test]
+    fn delete_profile_with_binding_fails_due_to_foreign_key() {
+        let (store, _temp, _) = store();
+        store.create_profile("work").unwrap();
+        let cwd = PathBuf::from("/work/my-project");
+        store.bind_profile(&cwd, "work").unwrap();
+
+        let result = store.delete_profile("work");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn profile_file_path_returns_settings_json_in_profiles_dir() {
+        let (store, _temp, _) = store();
+        let path = store.profile_file_path("work").unwrap();
+        assert_eq!(
+            path,
+            store.profiles_dir().unwrap().join("settings.work.json")
+        );
+    }
+
+    #[test]
+    fn profile_file_path_preserves_name_as_provided() {
+        let (store, _temp, _) = store();
+        let path = store.profile_file_path("Work_A-1").unwrap();
+        assert_eq!(
+            path,
+            store.profiles_dir().unwrap().join("settings.Work_A-1.json")
         );
     }
 }

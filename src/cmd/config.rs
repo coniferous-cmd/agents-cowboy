@@ -6,7 +6,8 @@ use cowboy::features::profile_editor::{edit_profile_json, EditOutcome};
 
 use super::{CommandMode, ConfigCommand, HistoryCommand};
 
-const CONFIG_USAGE: &str = "Usage: cowboy config <list|create|edit|delete|activate|history>";
+const CONFIG_USAGE: &str =
+    "Usage: cowboy config <list|create|edit|delete|activate|history|bind|unbind>";
 const HISTORY_USAGE: &str = "Usage: cowboy config history <list|show|activate|delete|prune>";
 
 pub(super) fn parse_config_args<I>(args: I) -> Result<CommandMode, String>
@@ -34,6 +35,22 @@ where
         },
         "activate" => ConfigCommand::Activate {
             name: exactly_one(&mut args, "config activate <name>")?,
+        },
+        "bind" => {
+            let project_path = args.next().ok_or_else(|| {
+                "Usage: cowboy config bind <project-path> <profile-name>".to_string()
+            })?;
+            let profile_name = args.next().ok_or_else(|| {
+                "Usage: cowboy config bind <project-path> <profile-name>".to_string()
+            })?;
+            reject_extra(&mut args, "config bind <project-path> <profile-name>")?;
+            ConfigCommand::Bind {
+                project_path,
+                profile_name,
+            }
+        }
+        "unbind" => ConfigCommand::Unbind {
+            project_path: exactly_one(&mut args, "config unbind <project-path>")?,
         },
         "history" => ConfigCommand::History(parse_history_args(args)?),
         unknown => return Err(format!("Unknown config command: {unknown}\n{CONFIG_USAGE}")),
@@ -182,6 +199,26 @@ fn handle_config_with_writer<W: Write>(
                 path.display()
             )?;
         }
+        ConfigCommand::Bind {
+            project_path,
+            profile_name,
+        } => {
+            let cwd = std::path::PathBuf::from(&project_path);
+            if !cwd.is_dir() {
+                return Err(format!("Project path does not exist: {project_path}").into());
+            }
+            store
+                .bind_profile(&cwd, &profile_name)
+                .map_err(|error| format!("Failed to bind profile: {error}"))?;
+            writeln!(output, "Bound profile '{profile_name}' to {project_path}")?;
+        }
+        ConfigCommand::Unbind { project_path } => {
+            let cwd = std::path::PathBuf::from(&project_path);
+            store
+                .unbind_profile(&cwd)
+                .map_err(|error| format!("Failed to unbind profile: {error}"))?;
+            writeln!(output, "Unbound profile from {project_path}")?;
+        }
         ConfigCommand::History(command) => handle_history(store, command, output)?,
     }
     Ok(())
@@ -276,6 +313,19 @@ mod tests {
                 name: "work".to_string()
             })
         );
+        assert_eq!(
+            parse(&["bind", "/my/project", "work"]).unwrap(),
+            CommandMode::Config(ConfigCommand::Bind {
+                project_path: "/my/project".to_string(),
+                profile_name: "work".to_string()
+            })
+        );
+        assert_eq!(
+            parse(&["unbind", "/my/project"]).unwrap(),
+            CommandMode::Config(ConfigCommand::Unbind {
+                project_path: "/my/project".to_string()
+            })
+        );
     }
 
     #[test]
@@ -310,6 +360,11 @@ mod tests {
             vec!["list", "extra"],
             vec!["create"],
             vec!["create", "one", "two"],
+            vec!["bind"],
+            vec!["bind", "/path/to/project"],
+            vec!["bind", "/path/to/project", "work", "extra"],
+            vec!["unbind"],
+            vec!["unbind", "/path/to/project", "extra"],
             vec!["history"],
             vec!["history", "unknown"],
             vec!["history", "list", "extra"],
@@ -359,6 +414,93 @@ mod tests {
         assert!(output.lines().any(|line| line == "work_profile"));
         assert!(output.contains("Deleted profile: work_profile"));
         assert!(store.list_profiles().unwrap().is_empty());
+    }
+
+    #[test]
+    fn bind_handler_creates_binding_and_reports_success() {
+        let (temp, store) = initialized_store();
+        store.create_profile("work").unwrap();
+        let project_dir = temp.path().join("my-project");
+        std::fs::create_dir(&project_dir).unwrap();
+        let mut output = Vec::new();
+
+        handle_config_with_writer(
+            &store,
+            ConfigCommand::Bind {
+                project_path: project_dir.display().to_string(),
+                profile_name: "work".to_string(),
+            },
+            &mut output,
+        )
+        .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Bound profile 'work'"));
+        let binding = store.project_binding(&project_dir).unwrap();
+        assert_eq!(binding.unwrap().profile_name, "work");
+    }
+
+    #[test]
+    fn bind_handler_rejects_nonexistent_project_path() {
+        let (_temp, store) = initialized_store();
+        store.create_profile("work").unwrap();
+        let mut output = Vec::new();
+
+        let result = handle_config_with_writer(
+            &store,
+            ConfigCommand::Bind {
+                project_path: "/nonexistent/path".to_string(),
+                profile_name: "work".to_string(),
+            },
+            &mut output,
+        );
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Project path does not exist"));
+    }
+
+    #[test]
+    fn unbind_handler_removes_binding_and_reports_success() {
+        let (temp, store) = initialized_store();
+        store.create_profile("work").unwrap();
+        let project_dir = temp.path().join("my-project");
+        std::fs::create_dir(&project_dir).unwrap();
+        store.bind_profile(&project_dir, "work").unwrap();
+        let mut output = Vec::new();
+
+        handle_config_with_writer(
+            &store,
+            ConfigCommand::Unbind {
+                project_path: project_dir.display().to_string(),
+            },
+            &mut output,
+        )
+        .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Unbound profile from"));
+        assert!(store.project_binding(&project_dir).unwrap().is_none());
+    }
+
+    #[test]
+    fn unbind_handler_fails_when_no_binding_exists() {
+        let (temp, store) = initialized_store();
+        let project_dir = temp.path().join("my-project");
+        std::fs::create_dir(&project_dir).unwrap();
+        let mut output = Vec::new();
+
+        let result = handle_config_with_writer(
+            &store,
+            ConfigCommand::Unbind {
+                project_path: project_dir.display().to_string(),
+            },
+            &mut output,
+        );
+
+        assert!(result.is_err());
     }
 
     #[test]

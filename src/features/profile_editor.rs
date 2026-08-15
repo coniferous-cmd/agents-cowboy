@@ -196,7 +196,7 @@ fn kill_process(child_id: u32) {
         // SAFETY: We're terminating a process we own
         unsafe {
             let handle = OpenProcess(PROCESS_TERMINATE, 0, child_id);
-            if handle != 0 {
+            if !handle.is_null() {
                 TerminateProcess(handle, 1);
                 windows_sys::Win32::Foundation::CloseHandle(handle);
             }

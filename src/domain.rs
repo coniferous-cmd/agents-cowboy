@@ -145,6 +145,12 @@ impl Project {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectProfileBinding {
+    pub project_cwd: PathBuf,
+    pub profile_name: String,
+}
+
 impl Project {
     /// Return the project display name for a single project.
     ///
@@ -237,6 +243,8 @@ pub enum StetsonError {
     ProjectSettingsNotFound(String),
     ThemeNotFound(String),
     HomeDirectoryUnavailable,
+    BindingNotFound(String),
+    ProfileAlreadyBound(String),
 }
 
 impl fmt::Display for StetsonError {
@@ -265,6 +273,10 @@ impl fmt::Display for StetsonError {
             }
             Self::ThemeNotFound(name) => write!(f, "theme not found: {name}"),
             Self::HomeDirectoryUnavailable => write!(f, "home directory is unavailable"),
+            Self::BindingNotFound(path) => write!(f, "no profile bound to project: {path}"),
+            Self::ProfileAlreadyBound(name) => {
+                write!(f, "profile is already bound to a project: {name}")
+            }
         }
     }
 }
@@ -289,6 +301,8 @@ impl StdError for StetsonError {
             Self::ProjectSettingsNotFound(_) => None,
             Self::ThemeNotFound(_) => None,
             Self::HomeDirectoryUnavailable => None,
+            Self::BindingNotFound(_) => None,
+            Self::ProfileAlreadyBound(_) => None,
         }
     }
 }

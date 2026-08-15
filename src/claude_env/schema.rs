@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use super::profiles::{ensure_private_dir, AtomicReplace};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const SETTINGS_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS settings (
     id INTEGER PRIMARY KEY,
@@ -55,6 +55,13 @@ CREATE TABLE IF NOT EXISTS profile_activation_journal (
     CHECK ((phase = 'failed' AND error IS NOT NULL) OR
            (phase != 'failed' AND error IS NULL))
 );"#;
+const PROJECT_BINDINGS_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS project_profile_bindings (
+    project_cwd TEXT PRIMARY KEY,
+    profile_name TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (profile_name) REFERENCES claude_profiles(name) ON DELETE RESTRICT
+);"#;
 
 pub(super) fn initialize_schema(
     connection: &mut Connection,
@@ -80,6 +87,7 @@ pub(super) fn initialize_schema(
     normalize_settings_table(&transaction)?;
     transaction.execute_batch(THEMES_SCHEMA)?;
     transaction.execute_batch(PROFILES_SCHEMA)?;
+    transaction.execute_batch(PROJECT_BINDINGS_SCHEMA)?;
 
     for index in [
         "idx_claude_env_value_env_name",
@@ -126,6 +134,7 @@ fn create_current_schema(connection: &Connection) -> Result<()> {
     connection.execute_batch(SETTINGS_SCHEMA)?;
     connection.execute_batch(THEMES_SCHEMA)?;
     connection.execute_batch(PROFILES_SCHEMA)?;
+    connection.execute_batch(PROJECT_BINDINGS_SCHEMA)?;
     Ok(())
 }
 
@@ -246,7 +255,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_is_version_one_without_legacy_tables() {
+    fn fresh_database_is_version_two_without_legacy_tables() {
         let temp = tempdir().unwrap();
         let store = ClaudeEnvStore::new(temp.path().join("db/cowboy.db"));
         store.initialize().unwrap();
@@ -255,7 +264,7 @@ mod tests {
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            1
+            2
         );
         for table in [
             "settings",
@@ -263,6 +272,7 @@ mod tests {
             "claude_profiles",
             "claude_settings_snapshots",
             "profile_activation_journal",
+            "project_profile_bindings",
         ] {
             assert!(exists(&connection, table));
         }

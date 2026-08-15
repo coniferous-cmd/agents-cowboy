@@ -21,6 +21,8 @@ Config commands:
   config edit <name>
   config delete <name>
   config activate <name>
+  config bind <project-path> <profile-name>
+  config unbind <project-path>
   config history list
   config history show <id>        Print snapshot JSON (may contain secrets)
   config history activate <id>

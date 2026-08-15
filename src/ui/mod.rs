@@ -49,6 +49,9 @@ pub fn render(frame: &mut Frame, state: &AppState) {
         ModalState::EditProfile { .. } => {
             // Editor owns the terminal; no modal rendering needed
         }
+        ModalState::BindProfile { profile_cursor } => {
+            render_bind_profile_modal(frame, state, profile_cursor)
+        }
         ModalState::None => {}
     }
 }
@@ -73,9 +76,17 @@ fn render_projects(frame: &mut Frame, state: &AppState, layout: &MainLayout) {
         .projects
         .iter()
         .zip(display_names.iter())
-        .map(|(project, name)| {
+        .zip(state.project_bindings.iter())
+        .map(|((project, name), binding)| {
             let summary = summarize_project_usage(project);
-            let label = build_project_row_label(name, &summary);
+            let label = if let Some(profile_name) = binding {
+                format!(
+                    "[{profile_name}] {}",
+                    build_project_row_label(name, &summary)
+                )
+            } else {
+                build_project_row_label(name, &summary)
+            };
             ListItem::new(label)
         })
         .collect();
@@ -281,6 +292,7 @@ fn render_status(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rec
         ModalState::DeleteConfirm => "Delete",
         ModalState::Info => "Info",
         ModalState::EditProfile { .. } => "Editing",
+        ModalState::BindProfile { .. } => "Bind Profile",
     };
 
     let status_message = state
@@ -331,6 +343,8 @@ fn shortcuts_for(state: &AppState) -> Vec<Span<'static>> {
                     ("Enter", "New Session"),
                     ("i", "Session Info"),
                     ("r", "Rename Session"),
+                    ("e", "Bind Profile"),
+                    ("u", "Unbind"),
                     ("Ctrl+D", "Delete Project"),
                     ("/", "Search"),
                     ("a", "Agent"),
@@ -358,6 +372,9 @@ fn shortcuts_for(state: &AppState) -> Vec<Span<'static>> {
                 ("q/Esc", "Cancel"),
             ],
             ModalState::EditProfile { .. } => &[], // Editor owns the terminal
+            ModalState::BindProfile { .. } => {
+                &[("↑↓", "Select"), ("Enter", "Bind"), ("q/Esc", "Cancel")]
+            }
             ModalState::Info => &[("q/Esc/Enter", "Close")],
         }
     };
@@ -506,6 +523,40 @@ fn render_confirm_modal(frame: &mut Frame, state: &AppState) {
         .map(Line::from)
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(text).block(block), area);
+}
+
+fn render_bind_profile_modal(frame: &mut Frame, state: &AppState, profile_cursor: usize) {
+    let area = centered_rect(40, 40, frame.area());
+    frame.render_widget(Clear, area);
+
+    let items: Vec<ListItem> = state
+        .profiles
+        .iter()
+        .map(|profile| {
+            let active = if state.active_profile_name.as_deref() == Some(&profile.name) {
+                " *"
+            } else {
+                ""
+            };
+            ListItem::new(format!("{}{active}", profile.name))
+        })
+        .collect();
+
+    let block = Block::default()
+        .title("Bind Profile to Project")
+        .borders(Borders::ALL)
+        .border_style(modal_border_style(&state.theme));
+
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(project_highlight_style(&state.theme))
+        .highlight_symbol("> ");
+
+    let mut list_state = ratatui::widgets::ListState::default();
+    if !state.profiles.is_empty() && profile_cursor < state.profiles.len() {
+        list_state.select(Some(profile_cursor));
+    }
+    frame.render_stateful_widget(list, area, &mut list_state);
 }
 
 /// Format an RFC 3339 timestamp to "yyyy-MM-dd HH:mm:ss" in the system-local
