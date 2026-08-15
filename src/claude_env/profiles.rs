@@ -1196,7 +1196,6 @@ mod tests {
         let profile = store.create_profile("work").unwrap();
         store.update_profile_json("work", profile_json).unwrap();
         let target = store.profiles_dir().unwrap().join("settings.work.json");
-        AtomicReplace::write(&target, profile_json.as_bytes()).unwrap();
         // Simulate the journal row that activate_profile would insert right
         // before swapping the symlink: hash is over the target file content.
         let connection = Connection::open(store.path()).unwrap();
