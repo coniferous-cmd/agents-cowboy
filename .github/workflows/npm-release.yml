@@ -1,0 +1,118 @@
+name: npm release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish to npm"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test
+
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x64
+            binary: cowboy
+            executable: cowboy
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            platform: linux-arm64
+            binary: cowboy
+            executable: cowboy
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            platform: darwin-x64
+            binary: cowboy
+            executable: cowboy
+          - os: macos-15
+            target: aarch64-apple-darwin
+            platform: darwin-arm64
+            binary: cowboy
+            executable: cowboy
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            platform: win32-x64
+            binary: cowboy.exe
+            executable: cowboy.exe
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            platform: win32-arm64
+            binary: cowboy.exe
+            executable: cowboy.exe
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: step-security/msvc-dev-cmd@v1
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p "dist/${{ matrix.platform }}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/${{ matrix.platform }}/${{ matrix.executable }}"
+          tar -czf "${{ matrix.platform }}.tar.gz" -C dist "${{ matrix.platform }}"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: dist-${{ matrix.platform }}
+          path: ${{ matrix.platform }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs:
+      - test
+      - build
+    runs-on: ubuntu-24.04
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish == true
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v6
+        with:
+          pattern: dist-*
+          path: artifacts
+          merge-multiple: true
+      - name: Unpack binaries
+        shell: bash
+        run: |
+          mkdir -p dist
+          for archive in artifacts/*.tar.gz; do
+            tar -xzf "$archive" -C dist
+          done
+      - run: npm run check:npm-dist
+      - run: npm pack --dry-run
+        env:
+          COWBOY_SKIP_BUILD: "1"
+      - run: npm publish --provenance
+        env:
+          COWBOY_SKIP_BUILD: "1"
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

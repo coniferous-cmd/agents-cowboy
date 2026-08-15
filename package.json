@@ -1,0 +1,24 @@
+{
+  "name": "cowboy",
+  "version": "0.2.2",
+  "description": "A Rust TUI for browsing and managing Claude Code sessions.",
+  "license": "GPL-3.0-only",
+  "bin": {
+    "cowboy": "bin/cowboy.js"
+  },
+  "files": [
+    "bin/",
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "cargo build --release",
+    "prepack": "node scripts/prepare-npm-binary.js",
+    "check:npm-dist": "node scripts/check-npm-dist.js",
+    "pack:dry-run": "npm pack --dry-run"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
