@@ -1188,6 +1188,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn activate_profile_journal_hash_targets_the_profile_file() {
         let (store, _temp, config) = store();
@@ -1208,10 +1209,7 @@ mod tests {
             )
             .unwrap();
         // Pretend the symlink already points at the target (mid-activation).
-        #[cfg(unix)]
         replace_with_symlink(&config.join("settings.json"), &target).unwrap();
-        #[cfg(not(unix))]
-        fs::write(config.join("settings.json"), profile_json).unwrap();
         assert!(matches!(
             store.recover_profile_activation().unwrap(),
             RecoveryOutcome::Recovered { .. }
