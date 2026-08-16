@@ -543,16 +543,22 @@ fn render_bind_profile_modal(frame: &mut Frame, state: &AppState, profile_cursor
     let area = centered_rect(40, 40, frame.area());
     frame.render_widget(Clear, area);
 
+    // Get the profile bound to the currently selected project
+    let bound_profile = state
+        .project_bindings
+        .get(state.selected_project)
+        .and_then(|b| b.as_deref());
+
     let items: Vec<ListItem> = state
         .profiles
         .iter()
         .map(|profile| {
-            let active = if state.active_profile_name.as_deref() == Some(&profile.name) {
-                " *"
+            let marker = if bound_profile == Some(&profile.name) {
+                " ◉"
             } else {
                 ""
             };
-            ListItem::new(format!("{}{active}", profile.name))
+            ListItem::new(format!("{}{marker}", profile.name))
         })
         .collect();
 
