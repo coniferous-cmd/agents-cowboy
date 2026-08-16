@@ -52,6 +52,16 @@ where
         "unbind" => ConfigCommand::Unbind {
             project_path: exactly_one(&mut args, "config unbind <project-path>")?,
         },
+        "copy" => {
+            let source = args
+                .next()
+                .ok_or_else(|| "Usage: cowboy config copy <source> <new-name>".to_string())?;
+            let new_name = args
+                .next()
+                .ok_or_else(|| "Usage: cowboy config copy <source> <new-name>".to_string())?;
+            reject_extra(&mut args, "config copy <source> <new-name>")?;
+            ConfigCommand::Copy { source, new_name }
+        }
         "history" => ConfigCommand::History(parse_history_args(args)?),
         unknown => return Err(format!("Unknown config command: {unknown}\n{CONFIG_USAGE}")),
     };
@@ -219,6 +229,12 @@ fn handle_config_with_writer<W: Write>(
                 .map_err(|error| format!("Failed to unbind profile: {error}"))?;
             writeln!(output, "Unbound profile from {project_path}")?;
         }
+        ConfigCommand::Copy { source, new_name } => {
+            let copied = store
+                .copy_profile(&source, &new_name)
+                .map_err(|error| format!("Failed to copy profile: {error}"))?;
+            writeln!(output, "Copied profile '{}' to '{}'", source, copied.name)?;
+        }
         ConfigCommand::History(command) => handle_history(store, command, output)?,
     }
     Ok(())
@@ -326,6 +342,13 @@ mod tests {
                 project_path: "/my/project".to_string()
             })
         );
+        assert_eq!(
+            parse(&["copy", "work", "work-debug"]).unwrap(),
+            CommandMode::Config(ConfigCommand::Copy {
+                source: "work".to_string(),
+                new_name: "work-debug".to_string()
+            })
+        );
     }
 
     #[test]
@@ -365,6 +388,9 @@ mod tests {
             vec!["bind", "/path/to/project", "work", "extra"],
             vec!["unbind"],
             vec!["unbind", "/path/to/project", "extra"],
+            vec!["copy"],
+            vec!["copy", "work"],
+            vec!["copy", "work", "work-debug", "extra"],
             vec!["history"],
             vec!["history", "unknown"],
             vec!["history", "list", "extra"],
@@ -501,6 +527,60 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn copy_handler_creates_profile_and_rejects_duplicate_name() {
+        let (_temp, store) = initialized_store();
+        let mut output = Vec::new();
+
+        // Create source profile with custom settings
+        handle_config_with_writer(
+            &store,
+            ConfigCommand::Create {
+                name: "work".to_string(),
+            },
+            &mut output,
+        )
+        .unwrap();
+        store
+            .update_profile_json("work", r#"{"env":{"KEY":"value"}}"#)
+            .unwrap();
+
+        // Copy to a new name
+        handle_config_with_writer(
+            &store,
+            ConfigCommand::Copy {
+                source: "work".to_string(),
+                new_name: "work-debug".to_string(),
+            },
+            &mut output,
+        )
+        .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Copied profile"));
+        assert!(output.contains("work-debug"));
+
+        // Verify the copy has identical JSON
+        let copied = store.profile("work-debug").unwrap();
+        assert_eq!(copied.settings_json, r#"{"env":{"KEY":"value"}}"#);
+
+        // Copy to same name as existing profile should fail
+        let mut fail_output = Vec::new();
+        let result = handle_config_with_writer(
+            &store,
+            ConfigCommand::Copy {
+                source: "work".to_string(),
+                new_name: "work".to_string(),
+            },
+            &mut fail_output,
+        );
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("profile already exists"));
     }
 
     #[test]

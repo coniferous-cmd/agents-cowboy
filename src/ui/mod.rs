@@ -52,6 +52,12 @@ pub fn render(frame: &mut Frame, state: &AppState) {
         ModalState::BindProfile { profile_cursor } => {
             render_bind_profile_modal(frame, state, profile_cursor)
         }
+        ModalState::PickProfile { profile_cursor } => {
+            render_pick_profile_modal(frame, state, profile_cursor)
+        }
+        ModalState::CopyProfile => {
+            render_input_modal(frame, "Copy Profile", &state.input_buffer, &state.theme)
+        }
         ModalState::None => {}
     }
 }
@@ -293,6 +299,8 @@ fn render_status(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rec
         ModalState::Info => "Info",
         ModalState::EditProfile { .. } => "Editing",
         ModalState::BindProfile { .. } => "Bind Profile",
+        ModalState::PickProfile { .. } => "Pick Profile",
+        ModalState::CopyProfile => "Copy Profile",
     };
 
     let status_message = state
@@ -331,6 +339,7 @@ fn shortcuts_for(state: &AppState) -> Vec<Span<'static>> {
             ("↑↓", "Move"),
             ("Enter", "Activate"),
             ("n", "New"),
+            ("c", "Copy"),
             ("Ctrl+D", "Delete"),
             ("q/Esc", "Quit"),
         ]
@@ -341,6 +350,7 @@ fn shortcuts_for(state: &AppState) -> Vec<Span<'static>> {
                     ("Tab/←→", "Focus"),
                     ("↑↓", "Move"),
                     ("Enter", "New Session"),
+                    ("p", "Pick Profile"),
                     ("i", "Session Info"),
                     ("r", "Rename Session"),
                     ("e", "Bind Profile"),
@@ -375,6 +385,10 @@ fn shortcuts_for(state: &AppState) -> Vec<Span<'static>> {
             ModalState::BindProfile { .. } => {
                 &[("↑↓", "Select"), ("Enter", "Bind"), ("q/Esc", "Cancel")]
             }
+            ModalState::PickProfile { .. } => {
+                &[("↑↓", "Select"), ("Enter", "Launch"), ("q/Esc", "Cancel")]
+            }
+            ModalState::CopyProfile => &[("Type", "Name"), ("Enter", "Copy"), ("q/Esc", "Cancel")],
             ModalState::Info => &[("q/Esc/Enter", "Close")],
         }
     };
@@ -544,6 +558,40 @@ fn render_bind_profile_modal(frame: &mut Frame, state: &AppState, profile_cursor
 
     let block = Block::default()
         .title("Bind Profile to Project")
+        .borders(Borders::ALL)
+        .border_style(modal_border_style(&state.theme));
+
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(project_highlight_style(&state.theme))
+        .highlight_symbol("> ");
+
+    let mut list_state = ratatui::widgets::ListState::default();
+    if !state.profiles.is_empty() && profile_cursor < state.profiles.len() {
+        list_state.select(Some(profile_cursor));
+    }
+    frame.render_stateful_widget(list, area, &mut list_state);
+}
+
+fn render_pick_profile_modal(frame: &mut Frame, state: &AppState, profile_cursor: usize) {
+    let area = centered_rect(40, 40, frame.area());
+    frame.render_widget(Clear, area);
+
+    let items: Vec<ListItem> = state
+        .profiles
+        .iter()
+        .map(|profile| {
+            let active = if state.active_profile_name.as_deref() == Some(&profile.name) {
+                " *"
+            } else {
+                ""
+            };
+            ListItem::new(format!("{}{active}", profile.name))
+        })
+        .collect();
+
+    let block = Block::default()
+        .title("Pick Profile to Launch With")
         .borders(Borders::ALL)
         .border_style(modal_border_style(&state.theme));
 

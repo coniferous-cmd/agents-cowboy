@@ -19,6 +19,8 @@ pub trait SessionRepository {
 pub trait ResumeLauncher {
     fn resume(&self, target: &ResumeTarget) -> AppResult<()>;
     fn launch_new(&self, cwd: &Path) -> AppResult<()>;
+    /// Launch a new session with a one-shot profile override (does not bind the profile).
+    fn launch_new_with_override(&self, cwd: &Path, profile_path: &Path) -> AppResult<()>;
 }
 
 pub trait ProfileRepository {
@@ -36,6 +38,8 @@ pub trait ProfileRepository {
     fn project_binding(&self, project_cwd: &Path) -> AppResult<Option<ProjectProfileBinding>>;
     #[allow(dead_code)]
     fn profile_bindings(&self, profile_name: &str) -> AppResult<Vec<ProjectProfileBinding>>;
+    fn profile_file_path(&self, name: &str) -> AppResult<std::path::PathBuf>;
+    fn copy_profile(&self, source: &str, new_name: &str) -> AppResult<ClaudeProfile>;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -91,6 +95,14 @@ impl ProfileRepository for NoProfileRepository {
     }
 
     fn profile_bindings(&self, _profile_name: &str) -> AppResult<Vec<ProjectProfileBinding>> {
+        Err("Profiles are unavailable".to_string())
+    }
+
+    fn profile_file_path(&self, _name: &str) -> AppResult<std::path::PathBuf> {
+        Err("Profiles are unavailable".to_string())
+    }
+
+    fn copy_profile(&self, _source: &str, _new_name: &str) -> AppResult<ClaudeProfile> {
         Err("Profiles are unavailable".to_string())
     }
 }
@@ -188,6 +200,14 @@ where
     pub fn project_binding(&self, project_cwd: &Path) -> AppResult<Option<ProjectProfileBinding>> {
         self.profiles.project_binding(project_cwd)
     }
+
+    pub fn profile_file_path(&self, name: &str) -> AppResult<std::path::PathBuf> {
+        self.profiles.profile_file_path(name)
+    }
+
+    pub fn copy_profile(&self, source: &str, new_name: &str) -> AppResult<ClaudeProfile> {
+        self.profiles.copy_profile(source, new_name)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -247,6 +267,25 @@ impl ResumeLauncher for ClaudeCliLauncher {
                 }
             }
         }
+
+        let status = command
+            .status()
+            .map_err(|error| format!("Failed to launch {command_name}: {error}"))?;
+
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("{command_name} exited with status {status}"))
+        }
+    }
+
+    fn launch_new_with_override(&self, cwd: &Path, profile_path: &Path) -> AppResult<()> {
+        let command_name = self
+            .env_store
+            .claude_command_alias()
+            .map_err(|error| format!("Failed to read claude command alias: {error}"))?;
+        let mut command = Command::new(&command_name);
+        command.current_dir(cwd).arg("--settings").arg(profile_path);
 
         let status = command
             .status()
@@ -378,5 +417,13 @@ impl ProfileRepository for ClaudeEnvStore {
 
     fn profile_bindings(&self, profile_name: &str) -> AppResult<Vec<ProjectProfileBinding>> {
         ClaudeEnvStore::profile_bindings(self, profile_name).map_err(|error| error.to_string())
+    }
+
+    fn profile_file_path(&self, name: &str) -> AppResult<std::path::PathBuf> {
+        ClaudeEnvStore::profile_file_path(self, name).map_err(|error| error.to_string())
+    }
+
+    fn copy_profile(&self, source: &str, new_name: &str) -> AppResult<ClaudeProfile> {
+        ClaudeEnvStore::copy_profile(self, source, new_name).map_err(|error| error.to_string())
     }
 }

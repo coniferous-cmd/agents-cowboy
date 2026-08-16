@@ -35,6 +35,10 @@ pub(crate) enum ConfigCommand {
     Unbind {
         project_path: String,
     },
+    Copy {
+        source: String,
+        new_name: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

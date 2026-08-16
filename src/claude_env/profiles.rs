@@ -215,6 +215,36 @@ impl ClaudeEnvStore {
         Ok(())
     }
 
+    /// Copy an existing profile to a new name, preserving settings JSON.
+    /// The new profile is created with identical settings; project bindings
+    /// are NOT copied.
+    pub fn copy_profile(&self, source: &str, new_name: &str) -> Result<ClaudeProfile> {
+        let source = validate_profile_name(source)?;
+        let new_name = validate_profile_name(new_name)?;
+        let source_profile = self.profile(&source)?;
+
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        match transaction.execute(
+            "INSERT INTO claude_profiles (name,settings_json) VALUES (?1,?2)",
+            params![&new_name, &source_profile.settings_json],
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                return Err(StetsonError::ProfileExists(new_name));
+            }
+            Err(error) => return Err(error.into()),
+        }
+
+        let target = self.profile_file_path(&new_name)?;
+        AtomicReplace::write(&target, source_profile.settings_json.as_bytes())?;
+        transaction.commit()?;
+        drop(connection);
+        self.profile(&new_name)
+    }
+
     pub fn list_snapshots(&self) -> Result<Vec<ClaudeSettingsSnapshot>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
@@ -1682,5 +1712,54 @@ mod tests {
             path,
             store.profiles_dir().unwrap().join("settings.Work_A-1.json")
         );
+    }
+
+    // ── copy_profile tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn copy_profile_creates_exact_duplicate() {
+        let (store, _temp, _) = store();
+        store.create_profile("work").unwrap();
+        store
+            .update_profile_json("work", r#"{"env":{"KEY":"value"}}"#)
+            .unwrap();
+
+        let copied = store.copy_profile("work", "work-debug").unwrap();
+
+        assert_eq!(copied.name, "work-debug");
+        assert_eq!(copied.settings_json, r#"{"env":{"KEY":"value"}}"#);
+        // Original unchanged
+        assert_eq!(
+            store.profile("work").unwrap().settings_json,
+            r#"{"env":{"KEY":"value"}}"#
+        );
+    }
+
+    #[test]
+    fn copy_profile_to_existing_name_returns_error() {
+        let (store, _temp, _) = store();
+        store.create_profile("work").unwrap();
+        store.create_profile("home").unwrap();
+
+        let result = store.copy_profile("work", "home");
+        assert!(matches!(result, Err(StetsonError::ProfileExists(_))));
+    }
+
+    #[test]
+    fn copy_profile_from_nonexistent_returns_error() {
+        let (store, _temp, _) = store();
+        store.create_profile("work").unwrap();
+
+        let result = store.copy_profile("nonexistent", "new-profile");
+        assert!(matches!(result, Err(StetsonError::ProfileNotFound(_))));
+    }
+
+    #[test]
+    fn copy_profile_with_invalid_new_name_returns_error() {
+        let (store, _temp, _) = store();
+        store.create_profile("work").unwrap();
+
+        let result = store.copy_profile("work", "invalid name");
+        assert!(matches!(result, Err(StetsonError::InvalidProfileName(_))));
     }
 }
