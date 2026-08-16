@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use super::profiles::{ensure_private_dir, AtomicReplace};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const SETTINGS_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS settings (
     id INTEGER PRIMARY KEY,
@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS profile_activation_journal (
 const PROJECT_BINDINGS_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS project_profile_bindings (
     project_cwd TEXT PRIMARY KEY,
-    profile_name TEXT NOT NULL UNIQUE,
+    profile_name TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (profile_name) REFERENCES claude_profiles(name) ON DELETE RESTRICT
 );"#;
@@ -73,6 +73,12 @@ pub(super) fn initialize_schema(
     }
     if version == SCHEMA_VERSION {
         create_current_schema(connection)?;
+        return Ok(());
+    }
+
+    // Migration from version 2 to 3: remove UNIQUE constraint on profile_name
+    if version == 2 {
+        migrate_v2_to_v3(connection)?;
         return Ok(());
     }
 
@@ -135,6 +141,39 @@ fn create_current_schema(connection: &Connection) -> Result<()> {
     connection.execute_batch(THEMES_SCHEMA)?;
     connection.execute_batch(PROFILES_SCHEMA)?;
     connection.execute_batch(PROJECT_BINDINGS_SCHEMA)?;
+    Ok(())
+}
+
+/// Migrate from schema version 2 to 3: remove UNIQUE constraint on profile_name
+/// in project_profile_bindings table to allow 1:N relationship.
+fn migrate_v2_to_v3(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+    // Create new table without UNIQUE constraint on profile_name
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS project_profile_bindings_v2 (
+            project_cwd TEXT PRIMARY KEY,
+            profile_name TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (profile_name) REFERENCES claude_profiles(name) ON DELETE RESTRICT
+        );",
+    )?;
+
+    // Copy data from old table to new table
+    transaction.execute_batch(
+        "INSERT OR IGNORE INTO project_profile_bindings_v2 (project_cwd, profile_name, created_at)
+         SELECT project_cwd, profile_name, created_at FROM project_profile_bindings;",
+    )?;
+
+    // Drop old table and rename new table
+    transaction.execute_batch("DROP TABLE project_profile_bindings;")?;
+    transaction.execute_batch(
+        "ALTER TABLE project_profile_bindings_v2 RENAME TO project_profile_bindings;",
+    )?;
+
+    // Update schema version
+    transaction.pragma_update(None, "user_version", 3)?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -255,7 +294,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_is_version_two_without_legacy_tables() {
+    fn fresh_database_is_version_three_without_legacy_tables() {
         let temp = tempdir().unwrap();
         let store = ClaudeEnvStore::new(temp.path().join("db/cowboy.db"));
         store.initialize().unwrap();
@@ -264,7 +303,7 @@ mod tests {
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            2
+            3
         );
         for table in [
             "settings",
@@ -372,5 +411,119 @@ mod tests {
             0
         );
         assert!(exists(&connection, "claude_project_settings"));
+    }
+
+    #[test]
+    fn migration_v2_to_v3_removes_unique_constraint_on_profile_name() {
+        let temp = tempdir().unwrap();
+        let db = temp.path().join("cowboy.db");
+        let connection = Connection::open(&db).unwrap();
+
+        // Create schema version 2 with UNIQUE constraint on profile_name
+        connection
+            .execute_batch(
+                "PRAGMA user_version = 2;
+                 CREATE TABLE settings(id INTEGER PRIMARY KEY, key TEXT NOT NULL UNIQUE, value TEXT NOT NULL);
+                 CREATE TABLE themes(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, is_active INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE claude_profiles(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, settings_json TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+                 CREATE TABLE claude_settings_snapshots(id INTEGER PRIMARY KEY, captured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, source TEXT, settings_json TEXT NOT NULL);
+                 CREATE TABLE profile_activation_journal(id INTEGER PRIMARY KEY CHECK (id = 1), target_kind TEXT NOT NULL, target_id TEXT NOT NULL, target_name TEXT, target_json_hash TEXT NOT NULL, phase TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+                 CREATE TABLE project_profile_bindings(project_cwd TEXT PRIMARY KEY, profile_name TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (profile_name) REFERENCES claude_profiles(name) ON DELETE RESTRICT);",
+            )
+            .unwrap();
+
+        // Insert test data
+        connection
+            .execute_batch(
+                "INSERT INTO claude_profiles (name, settings_json) VALUES ('work', '{}');
+                 INSERT INTO claude_profiles (name, settings_json) VALUES ('home', '{}');
+                 INSERT INTO project_profile_bindings (project_cwd, profile_name) VALUES ('/project/a', 'work');
+                 INSERT INTO project_profile_bindings (project_cwd, profile_name) VALUES ('/project/b', 'home');",
+            )
+            .unwrap();
+
+        drop(connection);
+
+        // Initialize store - this should trigger migration
+        let store = ClaudeEnvStore::new(&db);
+        store.initialize().unwrap();
+
+        let connection = Connection::open(&db).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+
+        // Verify data was migrated
+        let mut statement = connection
+            .prepare("SELECT project_cwd, profile_name FROM project_profile_bindings ORDER BY project_cwd")
+            .unwrap();
+        let rows: Vec<(String, String)> = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], ("/project/a".to_string(), "work".to_string()));
+        assert_eq!(rows[1], ("/project/b".to_string(), "home".to_string()));
+    }
+
+    #[test]
+    fn migration_v2_to_v3_allows_same_profile_bound_to_multiple_projects() {
+        let temp = tempdir().unwrap();
+        let db = temp.path().join("cowboy.db");
+        let connection = Connection::open(&db).unwrap();
+
+        // Create schema version 2
+        connection
+            .execute_batch(
+                "PRAGMA user_version = 2;
+                 CREATE TABLE settings(id INTEGER PRIMARY KEY, key TEXT NOT NULL UNIQUE, value TEXT NOT NULL);
+                 CREATE TABLE themes(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, is_active INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE claude_profiles(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, settings_json TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+                 CREATE TABLE claude_settings_snapshots(id INTEGER PRIMARY KEY, captured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, source TEXT, settings_json TEXT NOT NULL);
+                 CREATE TABLE profile_activation_journal(id INTEGER PRIMARY KEY CHECK (id = 1), target_kind TEXT NOT NULL, target_id TEXT NOT NULL, target_name TEXT, target_json_hash TEXT NOT NULL, phase TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+                 CREATE TABLE project_profile_bindings(project_cwd TEXT PRIMARY KEY, profile_name TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (profile_name) REFERENCES claude_profiles(name) ON DELETE RESTRICT);",
+            )
+            .unwrap();
+
+        connection
+            .execute_batch(
+                "INSERT INTO claude_profiles (name, settings_json) VALUES ('work', '{}');",
+            )
+            .unwrap();
+
+        drop(connection);
+
+        // Initialize store - this should trigger migration
+        let store = ClaudeEnvStore::new(&db);
+        store.initialize().unwrap();
+
+        // Now we should be able to bind the same profile to multiple projects
+        store
+            .bind_profile(&PathBuf::from("/project/a"), "work")
+            .unwrap();
+        store
+            .bind_profile(&PathBuf::from("/project/b"), "work")
+            .unwrap();
+
+        // Verify both bindings exist
+        let binding_a = store
+            .project_binding(&PathBuf::from("/project/a"))
+            .unwrap()
+            .unwrap();
+        let binding_b = store
+            .project_binding(&PathBuf::from("/project/b"))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(binding_a.profile_name, "work");
+        assert_eq!(binding_b.profile_name, "work");
+
+        // Verify profile_bindings returns both projects
+        let bindings = store.profile_bindings("work").unwrap();
+        assert_eq!(bindings.len(), 2);
     }
 }

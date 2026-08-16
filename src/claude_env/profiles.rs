@@ -189,10 +189,18 @@ impl ClaudeEnvStore {
         {
             let mut connection = self.connection()?;
             let transaction = connection.transaction()?;
-            let changed =
-                transaction.execute("DELETE FROM claude_profiles WHERE name=?1", [&name])?;
-            if changed == 0 {
-                return Err(StetsonError::ProfileNotFound(name));
+            match transaction.execute("DELETE FROM claude_profiles WHERE name=?1", [&name]) {
+                Ok(changed) => {
+                    if changed == 0 {
+                        return Err(StetsonError::ProfileNotFound(name));
+                    }
+                }
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if error.code == rusqlite::ErrorCode::ConstraintViolation =>
+                {
+                    return Err(StetsonError::ProfileInUse(name));
+                }
+                Err(error) => return Err(error.into()),
             }
             was_active = transaction.execute(
                 "DELETE FROM settings WHERE key=?1 AND value=?2",
@@ -524,20 +532,13 @@ impl ClaudeEnvStore {
         let _ = self.profile(&profile_name)?;
         let connection = self.connection()?;
         let cwd_str = project_cwd.to_string_lossy();
-        match connection.execute(
+        connection.execute(
             "INSERT INTO project_profile_bindings (project_cwd, profile_name) VALUES (?1, ?2) \
              ON CONFLICT(project_cwd) DO UPDATE SET profile_name=excluded.profile_name, \
              created_at=CURRENT_TIMESTAMP",
             params![cwd_str.as_ref(), profile_name],
-        ) {
-            Ok(_) => Ok(()),
-            Err(rusqlite::Error::SqliteFailure(error, _))
-                if error.code == rusqlite::ErrorCode::ConstraintViolation =>
-            {
-                Err(StetsonError::ProfileAlreadyBound(profile_name))
-            }
-            Err(error) => Err(error.into()),
-        }
+        )?;
+        Ok(())
     }
 
     pub fn unbind_profile(&self, project_cwd: &Path) -> Result<()> {
@@ -1692,6 +1693,30 @@ mod tests {
 
         let result = store.delete_profile("work");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn bind_profile_allows_same_profile_bound_to_multiple_projects() {
+        let (store, _temp, _) = store();
+        store.create_profile("work").unwrap();
+        let cwd_a = PathBuf::from("/work/project-a");
+        let cwd_b = PathBuf::from("/work/project-b");
+
+        store.bind_profile(&cwd_a, "work").unwrap();
+        store.bind_profile(&cwd_b, "work").unwrap();
+
+        // Both bindings should exist
+        let binding_a = store.project_binding(&cwd_a).unwrap().unwrap();
+        let binding_b = store.project_binding(&cwd_b).unwrap().unwrap();
+
+        assert_eq!(binding_a.profile_name, "work");
+        assert_eq!(binding_a.project_cwd, cwd_a);
+        assert_eq!(binding_b.profile_name, "work");
+        assert_eq!(binding_b.project_cwd, cwd_b);
+
+        // profile_bindings should return both projects
+        let bindings = store.profile_bindings("work").unwrap();
+        assert_eq!(bindings.len(), 2);
     }
 
     #[test]
