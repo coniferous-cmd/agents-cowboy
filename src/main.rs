@@ -113,7 +113,13 @@ fn run_tui_app(env_store: ClaudeEnvStore) -> std::result::Result<(), Box<dyn Err
 
         let Some(target) = app.take_pending_resume() else {
             if let Some(cwd) = app.take_pending_new_session() {
-                match launcher.launch_new(&cwd) {
+                let override_path = app.take_pending_profile_override();
+                let launch_result = if let Some(profile_path) = override_path {
+                    launcher.launch_new_with_override(&cwd, &profile_path)
+                } else {
+                    launcher.launch_new(&cwd)
+                };
+                match launch_result {
                     Ok(()) => {
                         app.resume_finished(format!(
                             "Session exited, launched from {}",
