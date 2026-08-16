@@ -1,7 +1,6 @@
 mod alias;
 mod config;
 mod help;
-mod install;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CommandMode {
@@ -9,7 +8,6 @@ pub(crate) enum CommandMode {
     Help,
     Config(ConfigCommand),
     Alias(String),
-    Install,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,7 +61,6 @@ where
         "-h" | "--help" | "help" => Ok(CommandMode::Help),
         "config" => config::parse_config_args(args),
         "alias" => alias::parse_alias_args(args),
-        "install" => install::parse_install_args(args),
         unknown => Err(format!("Unknown command: {unknown}")),
     }
 }
@@ -71,7 +68,6 @@ where
 pub(crate) use alias::handle_alias;
 pub(crate) use config::handle_config;
 pub(crate) use help::print_help;
-pub(crate) use install::handle_install;
 
 #[cfg(test)]
 mod tests {
@@ -96,19 +92,5 @@ mod tests {
         let mode = parse_cli_args(["--help".to_string()]).unwrap();
 
         assert_eq!(mode, CommandMode::Help);
-    }
-
-    #[test]
-    fn parses_install_command() {
-        let mode = parse_cli_args(["install".to_string()]).unwrap();
-
-        assert_eq!(mode, CommandMode::Install);
-    }
-
-    #[test]
-    fn rejects_install_with_extra_args() {
-        let result = parse_cli_args(["install".to_string(), "extra".to_string()]);
-
-        assert!(result.is_err());
     }
 }

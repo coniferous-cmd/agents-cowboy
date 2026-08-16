@@ -44,7 +44,6 @@ fn run() -> std::result::Result<(), Box<dyn Error>> {
         cmd::CommandMode::Help => Ok(()),
         cmd::CommandMode::Config(command) => cmd::handle_config(&env_store, command),
         cmd::CommandMode::Alias(command) => cmd::handle_alias(&env_store, command),
-        cmd::CommandMode::Install => cmd::handle_install(&env_store),
     }
 }
 

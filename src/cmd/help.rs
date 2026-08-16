@@ -7,13 +7,11 @@ Usage:
   cowboy
   cowboy config <command>
   cowboy alias <command>
-  cowboy install
   cowboy --help
 
 Commands:
   config   Manage Claude settings profiles and activation history
   alias    Set the Claude launcher command (default: claude)
-  install  Download and install the latest Claude Code binary
 
 Config commands:
   config list
