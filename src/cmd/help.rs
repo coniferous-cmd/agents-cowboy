@@ -10,7 +10,7 @@ Usage:
   cowboy --help
 
 Commands:
-  config   Manage Claude settings profiles and activation history
+  config   Manage Claude settings profiles
   alias    Set the Claude launcher command (default: claude)
 
 Config commands:
@@ -21,11 +21,7 @@ Config commands:
   config activate <name>
   config bind <project-path> <profile-name>
   config unbind <project-path>
-  config history list
-  config history show <id>        Print snapshot JSON (may contain secrets)
-  config history activate <id>
-  config history delete <id>
-  config history prune --keep <n>
+  config copy <source> <new-name>
 
 Options:
   -h, --help     Show this help message

@@ -234,7 +234,6 @@ pub enum StetsonError {
     InvalidProfileName(String),
     ProfileExists(String),
     ProfileNotFound(String),
-    SnapshotNotFound(i64),
     MigrationFailed(String),
     ActivationRecoveryFailed(String),
     UnsupportedSchemaVersion(i64),
@@ -258,7 +257,6 @@ impl fmt::Display for StetsonError {
             Self::InvalidProfileName(message) => write!(f, "invalid profile name: {message}"),
             Self::ProfileExists(name) => write!(f, "profile already exists: {name}"),
             Self::ProfileNotFound(name) => write!(f, "profile not found: {name}"),
-            Self::SnapshotNotFound(id) => write!(f, "settings snapshot not found: {id}"),
             Self::MigrationFailed(message) => write!(f, "metadata migration failed: {message}"),
             Self::ActivationRecoveryFailed(message) => {
                 write!(f, "profile activation recovery failed: {message}")
@@ -292,7 +290,6 @@ impl StdError for StetsonError {
             Self::InvalidProfileName(_) => None,
             Self::ProfileExists(_) => None,
             Self::ProfileNotFound(_) => None,
-            Self::SnapshotNotFound(_) => None,
             Self::MigrationFailed(_) => None,
             Self::ActivationRecoveryFailed(_) => None,
             Self::UnsupportedSchemaVersion(_) => None,

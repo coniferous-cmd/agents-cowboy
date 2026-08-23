@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use cowboy::claude_env::{ClaudeEnvStore, ClaudeProfile, ClaudeSettingsSnapshot};
+use cowboy::claude_env::{ClaudeEnvStore, ClaudeProfile};
 use cowboy::domain::{Project, ProjectProfileBinding, Session, SessionKey};
 use cowboy::infrastructure::ClaudeProjectsStore;
 
@@ -25,12 +25,9 @@ pub trait ResumeLauncher {
 
 pub trait ProfileRepository {
     fn list_profiles(&self) -> AppResult<Vec<ClaudeProfile>>;
-    fn list_snapshots(&self) -> AppResult<Vec<ClaudeSettingsSnapshot>>;
     fn active_profile_name(&self) -> AppResult<Option<String>>;
     fn activate_profile(&self, name: &str) -> AppResult<()>;
-    fn activate_snapshot(&self, id: i64) -> AppResult<()>;
     fn create_profile(&self, name: &str) -> AppResult<ClaudeProfile>;
-    fn create_snapshot(&self, profile_id: i64, settings_json: &str) -> AppResult<()>;
     fn update_profile_json(&self, name: &str, settings_json: &str) -> AppResult<ClaudeProfile>;
     fn delete_profile(&self, name: &str) -> AppResult<()>;
     fn bind_profile(&self, project_cwd: &Path, profile_name: &str) -> AppResult<()>;
@@ -50,10 +47,6 @@ impl ProfileRepository for NoProfileRepository {
         Ok(Vec::new())
     }
 
-    fn list_snapshots(&self) -> AppResult<Vec<ClaudeSettingsSnapshot>> {
-        Ok(Vec::new())
-    }
-
     fn active_profile_name(&self) -> AppResult<Option<String>> {
         Ok(None)
     }
@@ -62,15 +55,7 @@ impl ProfileRepository for NoProfileRepository {
         Err("Profiles are unavailable".to_string())
     }
 
-    fn activate_snapshot(&self, _id: i64) -> AppResult<()> {
-        Err("Profiles are unavailable".to_string())
-    }
-
     fn create_profile(&self, _name: &str) -> AppResult<ClaudeProfile> {
-        Err("Profiles are unavailable".to_string())
-    }
-
-    fn create_snapshot(&self, _profile_id: i64, _settings_json: &str) -> AppResult<()> {
         Err("Profiles are unavailable".to_string())
     }
 
@@ -151,16 +136,9 @@ where
         self.load_projects()
     }
 
-    pub fn load_profile_data(
-        &self,
-    ) -> AppResult<(
-        Vec<ClaudeProfile>,
-        Vec<ClaudeSettingsSnapshot>,
-        Option<String>,
-    )> {
+    pub fn load_profile_data(&self) -> AppResult<(Vec<ClaudeProfile>, Option<String>)> {
         Ok((
             self.profiles.list_profiles()?,
-            self.profiles.list_snapshots()?,
             self.profiles.active_profile_name()?,
         ))
     }
@@ -169,16 +147,8 @@ where
         self.profiles.activate_profile(name)
     }
 
-    pub fn activate_snapshot(&self, id: i64) -> AppResult<()> {
-        self.profiles.activate_snapshot(id)
-    }
-
     pub fn create_profile(&self, name: &str) -> AppResult<ClaudeProfile> {
         self.profiles.create_profile(name)
-    }
-
-    pub fn create_snapshot(&self, profile_id: i64, settings_json: &str) -> AppResult<()> {
-        self.profiles.create_snapshot(profile_id, settings_json)
     }
 
     pub fn update_profile_json(&self, name: &str, settings_json: &str) -> AppResult<ClaudeProfile> {
@@ -364,10 +334,6 @@ impl ProfileRepository for ClaudeEnvStore {
         ClaudeEnvStore::list_profiles(self).map_err(|error| error.to_string())
     }
 
-    fn list_snapshots(&self) -> AppResult<Vec<ClaudeSettingsSnapshot>> {
-        ClaudeEnvStore::list_snapshots(self).map_err(|error| error.to_string())
-    }
-
     fn active_profile_name(&self) -> AppResult<Option<String>> {
         ClaudeEnvStore::active_profile_name(self).map_err(|error| error.to_string())
     }
@@ -378,19 +344,8 @@ impl ProfileRepository for ClaudeEnvStore {
             .map_err(|error| error.to_string())
     }
 
-    fn activate_snapshot(&self, id: i64) -> AppResult<()> {
-        ClaudeEnvStore::activate_snapshot(self, id)
-            .map(|_| ())
-            .map_err(|error| error.to_string())
-    }
-
     fn create_profile(&self, name: &str) -> AppResult<ClaudeProfile> {
         ClaudeEnvStore::create_profile(self, name).map_err(|error| error.to_string())
-    }
-
-    fn create_snapshot(&self, profile_id: i64, settings_json: &str) -> AppResult<()> {
-        ClaudeEnvStore::create_snapshot(self, profile_id, settings_json)
-            .map_err(|error| error.to_string())
     }
 
     fn update_profile_json(&self, name: &str, settings_json: &str) -> AppResult<ClaudeProfile> {

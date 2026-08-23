@@ -7,8 +7,7 @@ mod store;
 mod themes;
 
 pub use self::profiles::{
-    validate_profile_name, validate_settings_json, AtomicReplace, ClaudeProfile,
-    ClaudeSettingsSnapshot, RecoveryOutcome,
+    validate_profile_name, validate_settings_json, AtomicReplace, ClaudeProfile, RecoveryOutcome,
 };
 pub use self::settings::default_metadata_db_path;
 

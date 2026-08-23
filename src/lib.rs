@@ -7,8 +7,7 @@ pub mod pricing;
 pub mod theme;
 
 pub use claude_env::{
-    AtomicReplace, ClaudeEnvStore, ClaudeProfile, ClaudeSettingsSnapshot, RecoveryOutcome, Setting,
-    Theme,
+    AtomicReplace, ClaudeEnvStore, ClaudeProfile, RecoveryOutcome, Setting, Theme,
 };
 pub use domain::{
     group_sessions_by_project, project_display_names, CostEstimate, Project, Result, Session,

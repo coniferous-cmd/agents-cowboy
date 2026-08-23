@@ -6,7 +6,6 @@ pub struct MainLayout {
     pub projects: Rect,
     pub sessions: Rect,
     pub profiles: Rect,
-    pub snapshots: Rect,
     pub status: Rect,
 }
 
@@ -28,18 +27,15 @@ pub fn compute_main_layout(area: Rect) -> MainLayout {
         .spacing(1)
         .split(chunks[1]);
 
-    let profile_rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .spacing(1)
-        .split(chunks[1]);
+    // Profiles now occupy the full middle column; the legacy snapshot subpanel
+    // was removed when snapshots were dropped.
+    let profile_area = chunks[1];
 
     MainLayout {
         tabs: chunks[0],
         projects: columns[0],
         sessions: columns[1],
-        profiles: profile_rows[0],
-        snapshots: profile_rows[1],
+        profiles: profile_area,
         status: chunks[2],
     }
 }
@@ -74,6 +70,8 @@ mod tests {
         let layout = compute_main_layout(Rect::new(0, 0, 100, 30));
 
         assert_eq!(layout.projects.right() + 1, layout.sessions.left());
-        assert_eq!(layout.profiles.bottom() + 1, layout.snapshots.top());
+        // profiles occupy the entire middle chunk, so its bottom edge equals
+        // the start of the status bar.
+        assert_eq!(layout.profiles.bottom(), layout.status.top());
     }
 }

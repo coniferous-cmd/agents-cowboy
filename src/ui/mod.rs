@@ -147,35 +147,6 @@ fn render_profiles(frame: &mut Frame, state: &AppState, layout: &MainLayout) {
         layout.profiles,
         &mut profile_state,
     );
-
-    let snapshot_items = if state.snapshots.is_empty() {
-        vec![ListItem::new("No snapshots")]
-    } else {
-        state
-            .snapshots
-            .iter()
-            .map(|snapshot| {
-                ListItem::new(format!(
-                    "{}  {} bytes  {}",
-                    snapshot.captured_at,
-                    snapshot.settings_json.len(),
-                    snapshot.source.as_deref().unwrap_or("-")
-                ))
-            })
-            .collect()
-    };
-    let mut snapshot_state = ratatui::widgets::ListState::default();
-    if state.profile_cursor >= state.profiles.len() && !state.snapshots.is_empty() {
-        snapshot_state.select(Some(state.profile_cursor - state.profiles.len()));
-    }
-    frame.render_stateful_widget(
-        List::new(snapshot_items)
-            .block(Block::default().title("Snapshots").borders(Borders::ALL))
-            .highlight_style(session_highlight_style(&state.theme))
-            .highlight_symbol("> "),
-        layout.snapshots,
-        &mut snapshot_state,
-    );
 }
 
 fn render_sessions(frame: &mut Frame, state: &AppState, layout: &MainLayout) {

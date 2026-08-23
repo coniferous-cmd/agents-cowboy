@@ -1,0 +1,24 @@
+name: spec-driven
+version: 1
+description: "Spec-driven change workflow"
+artifacts:
+  - id: proposal
+    generates: proposal.md
+    template: proposal.md
+    requires: []
+  - id: specs
+    generates: specs/**/*.md
+    template: specs/spec.md
+    requires: []
+  - id: design
+    generates: design.md
+    template: design.md
+    requires: []
+  - id: tasks
+    generates: tasks.md
+    template: tasks.md
+    requires: []
+apply:
+  requires:
+    - tasks
+  tracks: tasks.md

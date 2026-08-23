@@ -53,6 +53,11 @@ fn initialize_env_store() -> std::result::Result<ClaudeEnvStore, Box<dyn Error>>
     env_store
         .initialize()
         .map_err(|error| format!("Failed to initialize Claude env metadata store: {error}"))?;
+    // Back up the existing settings.json once per cowboy install. The flag is
+    // written inside perform_initial_backup, so we never copy twice.
+    env_store
+        .perform_initial_backup()
+        .map_err(|error| format!("Failed to perform initial settings backup: {error}"))?;
     env_store
         .seed_default_settings()
         .map_err(|error| format!("Failed to seed cowboy settings: {error}"))?;
@@ -233,13 +238,7 @@ fn spawn_initial_load_worker<R, P>(
         .name("cowboy-initial-load".to_string())
         .spawn(move || {
             let projects = repository.load_projects();
-            let profiles = (|| {
-                Ok((
-                    profiles.list_profiles()?,
-                    profiles.list_snapshots()?,
-                    profiles.active_profile_name()?,
-                ))
-            })();
+            let profiles = (|| Ok((profiles.list_profiles()?, profiles.active_profile_name()?)))();
             let _ = sender.send(InitialLoadCompletion { projects, profiles });
         });
 

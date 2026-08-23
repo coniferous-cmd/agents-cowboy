@@ -58,12 +58,12 @@ pricing rules, session parsing, or process-launch policy.
   - `project_paths.rs` — project directory encoding and path matching
   - `mutation.rs` — rename and delete operations
 - `src/claude_env/` (directory module) owns the SQLite metadata store:
-  - `mod.rs` — Profile, snapshot, setting, and theme types
+  - `mod.rs` — Profile, setting, and theme types
     module declarations, and tests
   - `store.rs` — `ClaudeEnvStore` main implementation
   - `schema.rs` — versioned database schema, private legacy dump, and migration
   - `settings.rs` — `Setting` data, default paths, launcher alias
-  - `profiles.rs` — Profile/snapshot repositories, activation journal, locking, permissions, and atomic replacement
+  - `profiles.rs` — Profile repositories, activation journal, locking, permissions, and atomic replacement
   - `themes.rs` — theme CRUD and activation
 - `src/pricing.rs` loads the embedded pricing table from
   `data/llm_pricing.json`.
@@ -117,8 +117,8 @@ error. This protects normal application-level exit paths, not forced process
 termination.
 
 Launching Claude temporarily exits the alternate screen and raw mode. The CLI
-Profile editor runs `$EDITOR` outside the TUI. Profile and snapshot activation
-use the shared repository directly and reload the Profiles view afterward.
+Profile editor runs `$EDITOR` outside the TUI. Profile activation uses the
+shared repository directly and reloads the Profiles view afterward.
 
 ## Storage Boundaries
 
@@ -134,7 +134,7 @@ use the shared repository directly and reload the Profiles view afterward.
 
 - The default database is stored in the platform configuration directory for
   cowboy.
-- SQLite stores configurable paths, Profiles, activation snapshots, journal state,
+- SQLite stores configurable paths, Profiles, journal state,
   launcher settings, and themes.
 - SQL reference files live under `docs/sql/`.
 - SQLite must not become a second source of truth for session discovery.
@@ -172,10 +172,19 @@ project- or session-specific overrides from cowboy.
 ## Profile Activation
 
 The `config edit` CLI validates edited content as a JSON object before updating
-SQLite. Profile activation serializes snapshot+journal preparation in SQLite,
+SQLite. Profile activation serializes journal preparation in SQLite,
 atomically replaces the configured global settings file, then commits active
 state and clears the journal. A cross-process lock prevents CLI/TUI races; startup
 recovers a matching pending journal by hashing the exact target bytes.
+
+### First-Launch Backup
+
+On the first launch that observes an existing `settings.json`, the startup flow
+copies it to `<claude_config_dir>/settings.json.cowboy-backup` with mode 0600
+and persists an `initial_backup_done` flag in the `settings` table. Subsequent
+runs skip the copy regardless of whether the backup file still exists. The
+backup is the only rollback path now that the SQLite-backed snapshot history
+has been removed.
 
 ## Cross-Platform Constraints
 

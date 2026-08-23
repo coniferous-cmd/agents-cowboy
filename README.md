@@ -5,7 +5,7 @@
 It presents three top-level tabs:
 
 - Projects and Sessions share the existing two-column session browser
-- Profiles lists named global settings plus activation snapshots
+- Profiles lists named global settings
 - Bottom: status and keyboard hints
 
 ## Features
@@ -18,7 +18,7 @@ It presents three top-level tabs:
 - Search sessions within the selected project
 - Inspect session metadata in a modal
 - Create and edit named Claude settings Profiles from the CLI
-- Atomically activate Profiles and roll back from SQLite-backed snapshots
+- Atomically activate Profiles, with a one-shot backup of the prior `settings.json` written to `settings.json.cowboy-backup` on first launch
 
 ## Requirements
 
@@ -104,7 +104,7 @@ whether the tag was created automatically or manually.
 | `r` | Rename session |
 | `Ctrl+D` | Delete project or session depending on focus; press `Ctrl+D` again in the confirmation dialog to confirm |
 | `/` | Search sessions |
-| `Enter` in Profiles | Activate the focused Profile or snapshot |
+| `Enter` in Profiles | Activate the focused Profile |
 | `Ctrl+D` in Profiles | Delete the focused Profile; press `Ctrl+D` again to confirm |
 | `q` / `Esc` | Quit |
 
@@ -123,7 +123,6 @@ cowboy config list               # List settings Profiles
 cowboy config create <name>      # Create an empty Profile
 cowboy config edit <name>        # Edit a Profile with $EDITOR
 cowboy config activate <name>    # Activate a Profile
-cowboy config history list       # List activation snapshots
 cowboy alias <command>           # Set Claude launcher alias
 cowboy install                   # Download & install latest Claude Code
 cowboy --help                    # Show help
@@ -164,13 +163,13 @@ After configuration, session resume should launch `my-claude --resume <session-i
 1. `~/.claude/projects/`
    Session and project source of truth. Session files are read and mutated directly from the filesystem.
 2. `~/.config/cowboy/cowboy.db`
-   SQLite metadata used for settings Profiles, activation snapshots, launcher settings, and themes. On macOS this is under `~/Library/Application Support/cowboy/`.
+   SQLite metadata used for settings Profiles, launcher settings, and themes. On macOS this is under `~/Library/Application Support/cowboy/`.
 
 Project and session discovery does not come from SQLite.
 
 ## Profiles and Environment
 
-Profiles store complete Claude Code settings JSON objects and atomically replace the configured global `settings.json` when activated. Before Profile activation, the previous valid file is captured as a SQLite snapshot. Snapshot activation is the recovery path and can replace a damaged current file without creating another snapshot.
+Profiles store complete Claude Code settings JSON objects and atomically replace the configured global `settings.json` when activated. On the first launch that observes an existing `settings.json`, cowboy copies it to `settings.json.cowboy-backup` next to it so users always have a one-shot rollback point.
 
 New and resumed Claude processes inherit cowboy's current process environment unchanged; project/session environment overrides are no longer stored or injected.
 

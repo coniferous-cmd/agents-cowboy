@@ -4,7 +4,7 @@ mod session_actions;
 // ── Internal modules ─────────────────────────────────────────────────────────
 
 mod state {
-    use cowboy::claude_env::{ClaudeProfile, ClaudeSettingsSnapshot};
+    use cowboy::claude_env::ClaudeProfile;
     use cowboy::domain::{AgentId, SessionKey};
     use cowboy::theme::ThemePalette;
     use std::path::PathBuf;
@@ -244,7 +244,6 @@ mod state {
     pub struct AppState {
         pub projects: Vec<cowboy::domain::Project>,
         pub profiles: Vec<ClaudeProfile>,
-        pub snapshots: Vec<ClaudeSettingsSnapshot>,
         pub active_profile_name: Option<String>,
         pub project_bindings: Vec<Option<String>>,
         pub main_tab: MainTab,
@@ -281,7 +280,6 @@ mod state {
             Self {
                 projects: Vec::new(),
                 profiles: Vec::new(),
-                snapshots: Vec::new(),
                 active_profile_name: None,
                 project_bindings: Vec::new(),
                 main_tab: MainTab::Projects,
@@ -491,37 +489,21 @@ mod navigation {
         }
 
         pub fn move_profile_cursor(&mut self, delta: isize) {
-            let len = self.state.profiles.len() + self.state.snapshots.len();
+            let len = self.state.profiles.len();
             self.state.profile_cursor = offset_index(self.state.profile_cursor, delta, len);
         }
 
         pub fn activate_profile_row(&mut self) {
-            if self.state.profile_cursor < self.state.profiles.len() {
-                let Some(name) = self
-                    .state
-                    .profiles
-                    .get(self.state.profile_cursor)
-                    .map(|profile| profile.name.clone())
-                else {
-                    return;
-                };
-                match self.application.activate_profile(&name) {
-                    Ok(()) => self.reload_profiles(format!("Activated profile: {name}")),
-                    Err(error) => self.show_toast(error),
-                }
-                return;
-            }
-
-            let snapshot_index = self
+            let Some(name) = self
                 .state
-                .profile_cursor
-                .saturating_sub(self.state.profiles.len());
-            let Some(snapshot_id) = self.state.snapshots.get(snapshot_index).map(|item| item.id)
+                .profiles
+                .get(self.state.profile_cursor)
+                .map(|profile| profile.name.clone())
             else {
                 return;
             };
-            match self.application.activate_snapshot(snapshot_id) {
-                Ok(()) => self.reload_profiles(format!("Activated snapshot: {snapshot_id}")),
+            match self.application.activate_profile(&name) {
+                Ok(()) => self.reload_profiles(format!("Activated profile: {name}")),
                 Err(error) => self.show_toast(error),
             }
         }
@@ -535,10 +517,6 @@ mod navigation {
         }
 
         pub fn begin_profile_copy(&mut self) {
-            // Copy only applies to profiles, not snapshots
-            if self.state.profile_cursor >= self.state.profiles.len() {
-                return;
-            }
             let Some(source) = self.state.profiles.get(self.state.profile_cursor) else {
                 return;
             };
@@ -564,11 +542,6 @@ mod navigation {
         }
 
         pub fn begin_profile_edit(&mut self) {
-            // Only works on profile list, not snapshot list
-            if self.state.profile_cursor >= self.state.profiles.len() {
-                return;
-            }
-
             let Some(profile) = self.state.profiles.get(self.state.profile_cursor) else {
                 self.show_toast("No profile selected");
                 return;
@@ -577,12 +550,6 @@ mod navigation {
             let profile_id = profile.id;
             let profile_name = profile.name.clone();
             let settings_json = profile.settings_json.clone();
-
-            // Create snapshot before editing
-            if let Err(error) = self.application.create_snapshot(profile_id, &settings_json) {
-                self.show_toast(format!("Failed to create snapshot: {error}"));
-                return;
-            }
 
             // Set modal state
             self.state.modal = ModalState::EditProfile { profile_id };
@@ -1267,11 +1234,7 @@ use crate::application::{
 use cowboy::features::profile_editor::EditOutcome;
 use std::path::PathBuf;
 
-pub type LoadedProfiles = (
-    Vec<cowboy::claude_env::ClaudeProfile>,
-    Vec<cowboy::claude_env::ClaudeSettingsSnapshot>,
-    Option<String>,
-);
+pub type LoadedProfiles = (Vec<cowboy::claude_env::ClaudeProfile>, Option<String>);
 
 #[derive(Debug)]
 pub struct InitialLoadCompletion {
@@ -1393,9 +1356,8 @@ where
         };
 
         let profiles_loaded = match completion.profiles {
-            Ok((profiles, snapshots, active_profile_name)) => {
+            Ok((profiles, active_profile_name)) => {
                 self.state.profiles = profiles;
-                self.state.snapshots = snapshots;
                 self.state.active_profile_name = active_profile_name;
                 true
             }
@@ -1476,11 +1438,10 @@ where
 
     fn reload_profiles(&mut self, status: impl Into<String>) {
         match self.application.load_profile_data() {
-            Ok((profiles, snapshots, active_profile_name)) => {
+            Ok((profiles, active_profile_name)) => {
                 self.state.profiles = profiles;
-                self.state.snapshots = snapshots;
                 self.state.active_profile_name = active_profile_name;
-                let len = self.state.profiles.len() + self.state.snapshots.len();
+                let len = self.state.profiles.len();
                 self.state.profile_cursor = self.state.profile_cursor.min(len.saturating_sub(1));
                 self.state.status = status.into();
             }
@@ -1592,10 +1553,6 @@ mod tests {
             Ok(self.profiles.clone())
         }
 
-        fn list_snapshots(&self) -> AppResult<Vec<cowboy::claude_env::ClaudeSettingsSnapshot>> {
-            Ok(Vec::new())
-        }
-
         fn active_profile_name(&self) -> AppResult<Option<String>> {
             Ok(None)
         }
@@ -1605,16 +1562,8 @@ mod tests {
             Ok(())
         }
 
-        fn activate_snapshot(&self, _id: i64) -> AppResult<()> {
-            Ok(())
-        }
-
         fn create_profile(&self, _name: &str) -> AppResult<cowboy::claude_env::ClaudeProfile> {
             Err("not used in this test".to_string())
-        }
-
-        fn create_snapshot(&self, _profile_id: i64, _settings_json: &str) -> AppResult<()> {
-            Ok(())
         }
 
         fn update_profile_json(
@@ -1773,7 +1722,7 @@ mod tests {
                 "/work/repo",
                 vec![session("session-1", "/work/repo")],
             )]),
-            profiles: Ok((Vec::new(), Vec::new(), None)),
+            profiles: Ok((Vec::new(), None)),
         });
 
         assert_eq!(app.state.projects.len(), 1);
@@ -2399,7 +2348,7 @@ mod tests {
 
     #[test]
     fn profile_tab_ignores_pane_keys_and_space_has_no_effect() {
-        use cowboy::claude_env::{ClaudeProfile, ClaudeSettingsSnapshot};
+        use cowboy::claude_env::ClaudeProfile;
 
         let mut app = app_with_projects(Vec::new());
         app.state.main_tab = MainTab::Profiles;
@@ -2409,12 +2358,6 @@ mod tests {
             settings_json: "{}".to_string(),
             updated_at: "2026-08-08 00:00:00".to_string(),
         }];
-        app.state.snapshots = vec![ClaudeSettingsSnapshot {
-            id: 9,
-            captured_at: "2026-08-08 00:00:00".to_string(),
-            source: None,
-            settings_json: "{}".to_string(),
-        }];
         let focus = app.state.focus;
 
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
@@ -2422,11 +2365,13 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         assert_eq!(app.state.focus, focus);
 
+        // With only one profile the cursor sits on it; pressing Down must not
+        // move past the end (the snapshot subpanel no longer extends the list).
         app.handle_key(key_char(' '));
         assert_eq!(app.state.profile_cursor, 0);
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(key_char(' '));
-        assert_eq!(app.state.profile_cursor, 1);
+        assert_eq!(app.state.profile_cursor, 0);
     }
 
     #[test]
@@ -2871,7 +2816,7 @@ mod tests {
     }
 
     #[test]
-    fn c_key_on_snapshot_list_does_not_open_copy_modal() {
+    fn c_key_on_profile_list_opens_copy_modal_even_when_cursor_at_boundary() {
         let profile = cowboy::claude_env::ClaudeProfile {
             id: 1,
             name: "work".to_string(),
@@ -2885,12 +2830,12 @@ mod tests {
             repository,
         );
         app.state.main_tab = MainTab::Profiles;
-        // Cursor is beyond all profiles (on snapshots list)
-        app.state.profile_cursor = 100;
+        // Cursor on the only profile (boundary value).
+        app.state.profile_cursor = 0;
 
         app.handle_key(key_char('c'));
 
-        assert_eq!(app.state.modal, ModalState::None);
+        assert_eq!(app.state.modal, ModalState::CopyProfile);
     }
 
     #[test]

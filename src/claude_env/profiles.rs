@@ -11,7 +11,8 @@ use super::settings::SETTING_CLAUDE_CONFIG_DIR;
 use super::ClaudeEnvStore;
 
 const ACTIVE_PROFILE_KEY: &str = "active_profile_name";
-const AUTO_SNAPSHOT_LIMIT: usize = 100;
+const INITIAL_BACKUP_DONE_KEY: &str = "initial_backup_done";
+const INITIAL_BACKUP_FILENAME: &str = "settings.json.cowboy-backup";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeProfile {
@@ -19,14 +20,6 @@ pub struct ClaudeProfile {
     pub name: String,
     pub settings_json: String,
     pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClaudeSettingsSnapshot {
-    pub id: i64,
-    pub captured_at: String,
-    pub source: Option<String>,
-    pub settings_json: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -253,45 +246,34 @@ impl ClaudeEnvStore {
         self.profile(&new_name)
     }
 
-    pub fn list_snapshots(&self) -> Result<Vec<ClaudeSettingsSnapshot>> {
-        let connection = self.connection()?;
-        let mut statement = connection.prepare(
-            "SELECT id,captured_at,source,settings_json FROM claude_settings_snapshots \
-             ORDER BY captured_at DESC,id DESC",
-        )?;
-        let rows = statement.query_map([], snapshot_from_row)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Into::into)
-    }
-
-    pub fn create_snapshot(&self, profile_id: i64, settings_json: &str) -> Result<()> {
-        let connection = self.connection()?;
-        connection.execute(
-            "INSERT INTO claude_settings_snapshots (source,settings_json) VALUES (?1,?2)",
-            params![format!("pre-edit:{profile_id}"), settings_json],
-        )?;
-        Ok(())
-    }
-
-    pub fn snapshot(&self, id: i64) -> Result<ClaudeSettingsSnapshot> {
-        let connection = self.connection()?;
-        connection.query_row(
-            "SELECT id,captured_at,source,settings_json FROM claude_settings_snapshots WHERE id=?1",
-            [id], snapshot_from_row,
-        ).optional()?.ok_or(StetsonError::SnapshotNotFound(id))
-    }
-
-    pub fn delete_snapshot(&self, id: i64) -> Result<()> {
-        let connection = self.connection()?;
-        if connection.execute("DELETE FROM claude_settings_snapshots WHERE id=?1", [id])? == 0 {
-            return Err(StetsonError::SnapshotNotFound(id));
+    pub fn perform_initial_backup(&self) -> Result<()> {
+        if self.get_setting(INITIAL_BACKUP_DONE_KEY)?.as_deref() == Some("1") {
+            return Ok(());
         }
-        Ok(())
-    }
+        let dir = self.claude_config_dir()?;
+        let source = dir.join("settings.json");
+        let backup = dir.join(INITIAL_BACKUP_FILENAME);
 
-    pub fn prune_snapshots(&self, keep: usize) -> Result<usize> {
-        let connection = self.connection()?;
-        prune_snapshots_on(&connection, keep)
+        // On any "not a regular file" branch we still mark the flag so the
+        // decision is sticky across launches. Backup file mode is enforced by
+        // ensure_private_file after the copy.
+        let should_copy = match fs::symlink_metadata(&source) {
+            Ok(metadata) => metadata.file_type().is_file(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+
+        if should_copy {
+            let bytes = fs::read(&source)?;
+            AtomicReplace::write(&backup, &bytes)?;
+            ensure_private_file(&backup)?;
+        }
+
+        self.upsert_setting(&super::Setting {
+            key: INITIAL_BACKUP_DONE_KEY.to_string(),
+            value: "1".to_string(),
+        })?;
+        Ok(())
     }
 
     pub fn activate_profile(&self, name: &str) -> Result<PathBuf> {
@@ -305,10 +287,9 @@ impl ClaudeEnvStore {
         self.perform_activation(
             "profile",
             profile.id.to_string(),
-            Some(&name),
+            &name,
             &target,
             &profile.settings_json,
-            Some(format!("pre-activate:{name}")),
         )?;
         self.finish_activation(Some(&name))?;
         self.global_settings_path()
@@ -343,45 +324,19 @@ impl ClaudeEnvStore {
         Ok(())
     }
 
-    pub fn activate_snapshot(&self, id: i64) -> Result<PathBuf> {
-        let _lock = self.activation_lock()?;
-        self.clear_failed_journal()?;
-        let snapshot = self.snapshot(id)?;
-        validate_settings_json(&snapshot.settings_json)?;
-        let target = self.orphan_file_path()?;
-        self.perform_activation(
-            "snapshot",
-            id.to_string(),
-            None,
-            &target,
-            &snapshot.settings_json,
-            None,
-        )?;
-        self.finish_activation(None)?;
-        self.global_settings_path()
-    }
-
     fn perform_activation(
         &self,
         kind: &str,
         target_id: String,
-        target_name: Option<&str>,
+        target_name: &str,
         target_file: &Path,
         settings_json: &str,
-        snapshot_source: Option<String>,
     ) -> Result<()> {
         let link = self.global_settings_path()?;
-        let current = self.read_current_settings(&link)?;
         let hash = sha256(settings_json.as_bytes());
         {
             let mut connection = self.connection()?;
             let transaction = connection.transaction()?;
-            if let (Some(raw), Some(source)) = (current, snapshot_source) {
-                transaction.execute(
-                    "INSERT INTO claude_settings_snapshots (source,settings_json) VALUES (?1,?2)",
-                    params![source, raw],
-                )?;
-            }
             insert_journal(&transaction, kind, target_id, target_name, &hash)?;
             transaction.commit()?;
         }
@@ -398,23 +353,6 @@ impl ClaudeEnvStore {
         Ok(self.profiles_dir()?.join(format!("settings.{name}.json")))
     }
 
-    fn orphan_file_path(&self) -> Result<PathBuf> {
-        Ok(self.profiles_dir()?.join("settings._orphan.json"))
-    }
-
-    fn read_current_settings(&self, link: &Path) -> Result<Option<String>> {
-        match fs::read(link) {
-            Ok(bytes) => {
-                let raw = std::str::from_utf8(&bytes)
-                    .map_err(|error| StetsonError::InvalidSettingsFile(error.to_string()))?;
-                validate_settings_json(raw)?;
-                Ok(Some(raw.to_string()))
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error.into()),
-        }
-    }
-
     pub fn recover_profile_activation(&self) -> Result<RecoveryOutcome> {
         let _lock = self.activation_lock()?;
         let connection = self.connection()?;
@@ -427,7 +365,7 @@ impl ClaudeEnvStore {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
                         row.get::<_, Option<String>>(5)?,
@@ -445,7 +383,7 @@ impl ClaudeEnvStore {
         let failure_message = match read_symlink_target_hash(&link) {
             Some(actual) if actual == expected.as_str() => {
                 drop(connection);
-                self.finish_activation(name.as_deref())?;
+                self.finish_activation(Some(&name))?;
                 return Ok(RecoveryOutcome::Recovered {
                     target_kind: kind,
                     target_id: id,
@@ -506,7 +444,6 @@ impl ClaudeEnvStore {
                 transaction.execute("DELETE FROM settings WHERE key=?1", [ACTIVE_PROFILE_KEY])?;
             }
         }
-        prune_snapshots_on(&transaction, AUTO_SNAPSHOT_LIMIT)?;
         transaction.execute("DELETE FROM profile_activation_journal WHERE id=1", [])?;
         transaction.commit()?;
         Ok(())
@@ -604,7 +541,7 @@ fn insert_journal(
     transaction: &Transaction<'_>,
     kind: &str,
     id: String,
-    name: Option<&str>,
+    name: &str,
     hash: &str,
 ) -> Result<()> {
     transaction.execute("DELETE FROM profile_activation_journal WHERE id=1", [])?;
@@ -617,31 +554,12 @@ fn insert_journal(
     Ok(())
 }
 
-fn prune_snapshots_on(connection: &rusqlite::Connection, keep: usize) -> Result<usize> {
-    let changed = connection.execute(
-        "DELETE FROM claude_settings_snapshots WHERE id IN (\
-           SELECT id FROM claude_settings_snapshots \
-           ORDER BY captured_at DESC,id DESC LIMIT -1 OFFSET ?1)",
-        [keep as i64],
-    )?;
-    Ok(changed)
-}
-
 fn profile_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClaudeProfile> {
     Ok(ClaudeProfile {
         id: row.get(0)?,
         name: row.get(1)?,
         settings_json: row.get(2)?,
         updated_at: row.get(3)?,
-    })
-}
-
-fn snapshot_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClaudeSettingsSnapshot> {
-    Ok(ClaudeSettingsSnapshot {
-        id: row.get(0)?,
-        captured_at: row.get(1)?,
-        source: row.get(2)?,
-        settings_json: row.get(3)?,
     })
 }
 
@@ -989,69 +907,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn activation_captures_exact_snapshot_and_snapshot_restore_does_not_recurse() {
-        let (store, _temp, config) = store();
-        let profiles_dir = store.profiles_dir().unwrap();
-        fs::create_dir_all(&config).unwrap();
-        // Simulate the post-migration state: default profile already exists,
-        // settings.json is a symlink to profiles/settings.default.json.
-        let default_json = "{\n  \"old\": true\n}";
-        AtomicReplace::write(
-            &profiles_dir.join("settings.default.json"),
-            default_json.as_bytes(),
-        )
-        .unwrap();
-        store.create_profile("default").unwrap();
-        store.update_profile_json("default", default_json).unwrap();
-        replace_with_symlink(
-            &config.join("settings.json"),
-            &profiles_dir.join("settings.default.json"),
-        )
-        .unwrap();
-        store.create_profile("work").unwrap();
-        store
-            .update_profile_json("work", r#"{"new":true}"#)
-            .unwrap();
-        assert_eq!(
-            store.activate_profile("work").unwrap(),
-            config.join("settings.json")
-        );
-        let meta = fs::symlink_metadata(config.join("settings.json")).unwrap();
-        assert!(
-            meta.file_type().is_symlink(),
-            "settings.json should be a symlink after activation"
-        );
-        assert_eq!(
-            fs::read_link(config.join("settings.json")).unwrap(),
-            profiles_dir.join("settings.work.json")
-        );
-        assert_eq!(
-            fs::read_to_string(config.join("settings.json")).unwrap(),
-            r#"{"new":true}"#
-        );
-        let snapshots = store.list_snapshots().unwrap();
-        assert_eq!(snapshots.len(), 1);
-        assert_eq!(snapshots[0].source.as_deref(), Some("pre-activate:work"));
-        assert_eq!(snapshots[0].settings_json, default_json);
-        store.activate_snapshot(snapshots[0].id).unwrap();
-        assert!(fs::symlink_metadata(config.join("settings.json"))
-            .unwrap()
-            .file_type()
-            .is_symlink());
-        assert_eq!(
-            fs::read_link(config.join("settings.json")).unwrap(),
-            profiles_dir.join("settings._orphan.json")
-        );
-        assert_eq!(
-            fs::read_to_string(config.join("settings.json")).unwrap(),
-            default_json
-        );
-        assert_eq!(store.list_snapshots().unwrap().len(), 1);
-        assert_eq!(store.get_setting(ACTIVE_PROFILE_KEY).unwrap(), None);
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn first_activation_migrates_existing_real_settings_into_default_profile() {
         let (store, _temp, config) = store();
         let profiles_dir = store.profiles_dir().unwrap();
@@ -1143,30 +998,6 @@ mod tests {
             fs::read_to_string(config.join("settings.json")).unwrap(),
             "[]"
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn activate_snapshot_overwrites_prior_orphan_file() {
-        let (store, _temp, config) = store();
-        let profiles_dir = store.profiles_dir().unwrap();
-        fs::create_dir_all(&config).unwrap();
-        let orphan = profiles_dir.join("settings._orphan.json");
-        let profile = store.create_profile("snap-host").unwrap();
-        store
-            .create_snapshot(profile.id, r#"{"first":true}"#)
-            .unwrap();
-        let first_id = store.list_snapshots().unwrap()[0].id;
-        store.activate_snapshot(first_id).unwrap();
-        assert_eq!(fs::read_link(config.join("settings.json")).unwrap(), orphan);
-        assert_eq!(fs::read_to_string(&orphan).unwrap(), r#"{"first":true}"#);
-        store
-            .create_snapshot(profile.id, r#"{"second":true}"#)
-            .unwrap();
-        let second_id = store.list_snapshots().unwrap()[0].id;
-        store.activate_snapshot(second_id).unwrap();
-        assert_eq!(fs::read_link(config.join("settings.json")).unwrap(), orphan);
-        assert_eq!(fs::read_to_string(&orphan).unwrap(), r#"{"second":true}"#);
     }
 
     #[cfg(unix)]
@@ -1390,7 +1221,6 @@ mod tests {
             fs::read_to_string(config.join("settings.json")).unwrap(),
             "broken"
         );
-        assert!(store.list_snapshots().unwrap().is_empty());
     }
 
     #[cfg(unix)]
@@ -1538,30 +1368,6 @@ mod tests {
             fs::metadata(&file).unwrap().permissions().mode() & 0o777,
             0o640
         );
-    }
-
-    #[test]
-    fn snapshot_order_and_prune_use_id_as_stable_tiebreaker() {
-        let (store, _temp, _) = store();
-        let connection = store.connection().unwrap();
-        for raw in [r#"{"n":1}"#, r#"{"n":2}"#, r#"{"n":3}"#] {
-            connection.execute(
-                "INSERT INTO claude_settings_snapshots (captured_at,settings_json) VALUES ('2026-01-01 00:00:00',?1)",
-                [raw],
-            ).unwrap();
-        }
-        assert_eq!(
-            store
-                .list_snapshots()
-                .unwrap()
-                .iter()
-                .map(|item| item.id)
-                .collect::<Vec<_>>(),
-            [3, 2, 1]
-        );
-        assert_eq!(store.prune_snapshots(1).unwrap(), 2);
-        assert_eq!(store.list_snapshots().unwrap()[0].id, 3);
-        assert_eq!(store.prune_snapshots(0).unwrap(), 1);
     }
 
     #[cfg(unix)]
@@ -1736,6 +1542,110 @@ mod tests {
         assert_eq!(
             path,
             store.profiles_dir().unwrap().join("settings.Work_A-1.json")
+        );
+    }
+
+    // ── copy_profile tests ─────────────────────────────────────────────────
+
+    // ── first-launch backup tests ───────────────────────────────────────────
+
+    #[test]
+    fn perform_initial_backup_copies_existing_settings_file() {
+        let (store, _temp, config) = store();
+        fs::create_dir_all(&config).unwrap();
+        let original = "{\"key\":\"value\"}";
+        fs::write(config.join("settings.json"), original).unwrap();
+
+        store.perform_initial_backup().unwrap();
+
+        let backup = config.join("settings.json.cowboy-backup");
+        assert!(backup.exists());
+        assert_eq!(fs::read_to_string(&backup).unwrap(), original);
+        assert_eq!(
+            store
+                .get_setting(INITIAL_BACKUP_DONE_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn perform_initial_backup_is_idempotent_via_flag() {
+        let (store, _temp, config) = store();
+        fs::create_dir_all(&config).unwrap();
+        let original = "{\"v\":1}";
+        fs::write(config.join("settings.json"), original).unwrap();
+
+        store.perform_initial_backup().unwrap();
+        // Overwrite the source file: a second call must NOT replace the backup.
+        let overwritten = "{\"v\":2}";
+        fs::write(config.join("settings.json"), overwritten).unwrap();
+        store.perform_initial_backup().unwrap();
+
+        let backup = config.join("settings.json.cowboy-backup");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn perform_initial_backup_skipped_when_settings_is_symlink() {
+        let (store, _temp, config) = store();
+        fs::create_dir_all(&config).unwrap();
+        let real_target = config.join("settings.real.json");
+        fs::write(&real_target, "{}").unwrap();
+        std::os::unix::fs::symlink(&real_target, config.join("settings.json")).unwrap();
+
+        store.perform_initial_backup().unwrap();
+
+        let backup = config.join("settings.json.cowboy-backup");
+        assert!(
+            !backup.exists(),
+            "backup must not be created when settings.json is a symlink"
+        );
+        assert_eq!(
+            store
+                .get_setting(INITIAL_BACKUP_DONE_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn perform_initial_backup_skipped_when_settings_missing() {
+        let (store, _temp, config) = store();
+        fs::create_dir_all(&config).unwrap();
+        // No settings.json at all.
+
+        store.perform_initial_backup().unwrap();
+
+        let backup = config.join("settings.json.cowboy-backup");
+        assert!(!backup.exists());
+        // The flag is still set so we never re-check on subsequent launches.
+        assert_eq!(
+            store
+                .get_setting(INITIAL_BACKUP_DONE_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_file_has_private_permissions_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let (store, _temp, config) = store();
+        fs::create_dir_all(&config).unwrap();
+        fs::write(config.join("settings.json"), "{}").unwrap();
+
+        store.perform_initial_backup().unwrap();
+
+        let backup = config.join("settings.json.cowboy-backup");
+        assert_eq!(
+            fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+            0o600
         );
     }
 

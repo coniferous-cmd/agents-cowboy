@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use super::profiles::{ensure_private_dir, AtomicReplace};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const SETTINGS_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS settings (
     id INTEGER PRIMARY KEY,
@@ -35,23 +35,15 @@ CREATE TABLE IF NOT EXISTS claude_profiles (
     settings_json TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
-CREATE TABLE IF NOT EXISTS claude_settings_snapshots (
-    id INTEGER PRIMARY KEY,
-    captured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    source TEXT,
-    settings_json TEXT NOT NULL
-);
 CREATE TABLE IF NOT EXISTS profile_activation_journal (
     id INTEGER PRIMARY KEY CHECK (id = 1),
-    target_kind TEXT NOT NULL CHECK (target_kind IN ('profile', 'snapshot')),
+    target_kind TEXT NOT NULL CHECK (target_kind IN ('profile')),
     target_id TEXT NOT NULL,
-    target_name TEXT,
+    target_name TEXT NOT NULL,
     target_json_hash TEXT NOT NULL,
     phase TEXT NOT NULL CHECK (phase IN ('prepared', 'file_replaced', 'failed')),
     error TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CHECK ((target_kind = 'profile' AND target_name IS NOT NULL) OR
-           (target_kind = 'snapshot' AND target_name IS NULL)),
     CHECK ((phase = 'failed' AND error IS NOT NULL) OR
            (phase != 'failed' AND error IS NULL))
 );"#;
@@ -73,6 +65,13 @@ pub(super) fn initialize_schema(
     }
     if version == SCHEMA_VERSION {
         create_current_schema(connection)?;
+        return Ok(());
+    }
+
+    // Migration from version 3 to 4: drop snapshot table, simplify journal,
+    // mark first-launch backup as done.
+    if version == 3 {
+        migrate_v3_to_v4(connection)?;
         return Ok(());
     }
 
@@ -173,6 +172,45 @@ fn migrate_v2_to_v3(connection: &mut Connection) -> Result<()> {
 
     // Update schema version
     transaction.pragma_update(None, "user_version", 3)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Migrate from schema version 3 to 4: drop the snapshot table and rebuild
+/// the activation journal (target_kind can only be 'profile', target_name is
+/// now NOT NULL). The first-launch backup flag is intentionally NOT set here so
+/// that the startup flow's `perform_initial_backup` call still runs once after
+/// the upgrade — v3 users get the same `settings.json.cowboy-backup` file that
+/// fresh installs get.
+fn migrate_v3_to_v4(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+    // Drop the snapshot table outright; SQLite cannot ALTER it and the data is
+    // intentionally discarded. Users who need history can rely on
+    // `settings.json.cowboy-backup` (written by perform_initial_backup right
+    // after initialize() returns).
+    transaction.execute("DROP TABLE IF EXISTS claude_settings_snapshots", [])?;
+
+    // Rebuild the journal: clear any in-flight row (id=1), drop the old table,
+    // recreate it with the v4 schema (profile-only, target_name NOT NULL).
+    transaction.execute("DELETE FROM profile_activation_journal WHERE id=1", [])?;
+    transaction.execute("DROP TABLE profile_activation_journal", [])?;
+    transaction.execute_batch(
+        "CREATE TABLE profile_activation_journal (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            target_kind TEXT NOT NULL CHECK (target_kind IN ('profile')),
+            target_id TEXT NOT NULL,
+            target_name TEXT NOT NULL,
+            target_json_hash TEXT NOT NULL,
+            phase TEXT NOT NULL CHECK (phase IN ('prepared', 'file_replaced', 'failed')),
+            error TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CHECK ((phase = 'failed' AND error IS NOT NULL) OR
+                   (phase != 'failed' AND error IS NULL))
+        );",
+    )?;
+
+    transaction.pragma_update(None, "user_version", 4)?;
     transaction.commit()?;
     Ok(())
 }
@@ -294,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_is_version_three_without_legacy_tables() {
+    fn fresh_database_is_version_four_without_snapshot_or_legacy_tables() {
         let temp = tempdir().unwrap();
         let store = ClaudeEnvStore::new(temp.path().join("db/cowboy.db"));
         store.initialize().unwrap();
@@ -303,18 +341,18 @@ mod tests {
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            3
+            4
         );
         for table in [
             "settings",
             "themes",
             "claude_profiles",
-            "claude_settings_snapshots",
             "profile_activation_journal",
             "project_profile_bindings",
         ] {
             assert!(exists(&connection, table));
         }
+        assert!(!exists(&connection, "claude_settings_snapshots"));
         for table in [
             "claude_env",
             "claude_envs",
@@ -525,5 +563,119 @@ mod tests {
         // Verify profile_bindings returns both projects
         let bindings = store.profile_bindings("work").unwrap();
         assert_eq!(bindings.len(), 2);
+    }
+
+    #[test]
+    fn v3_to_v4_migration_drops_snapshot_table_and_writes_flag() {
+        let temp = tempdir().unwrap();
+        let db = temp.path().join("cowboy.db");
+        let config_dir = temp.path().join("claude");
+        let connection = Connection::open(&db).unwrap();
+
+        // Seed v3 schema with one snapshot row and a non-trivial settings file.
+        connection
+            .execute_batch(
+                "PRAGMA user_version = 3;
+                 CREATE TABLE settings(id INTEGER PRIMARY KEY, key TEXT NOT NULL UNIQUE, value TEXT NOT NULL);
+                 CREATE TABLE themes(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, is_active INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE claude_profiles(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, settings_json TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+                 CREATE TABLE claude_settings_snapshots(id INTEGER PRIMARY KEY, captured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, source TEXT, settings_json TEXT NOT NULL);
+                 CREATE TABLE profile_activation_journal(id INTEGER PRIMARY KEY CHECK (id = 1), target_kind TEXT NOT NULL, target_id TEXT NOT NULL, target_name TEXT, target_json_hash TEXT NOT NULL, phase TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+                 CREATE TABLE project_profile_bindings(project_cwd TEXT PRIMARY KEY, profile_name TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (profile_name) REFERENCES claude_profiles(name) ON DELETE RESTRICT);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO claude_settings_snapshots (settings_json) VALUES ('{\"old\":true}')",
+                [],
+            )
+            .unwrap();
+        fs::create_dir_all(&config_dir).unwrap();
+        let original = "{\"key\":\"value\"}";
+        fs::write(config_dir.join("settings.json"), original).unwrap();
+        connection
+            .execute(
+                "INSERT INTO settings (key,value) VALUES ('claude_config_dir',?1)",
+                [config_dir.display().to_string()],
+            )
+            .unwrap();
+
+        drop(connection);
+
+        // Trigger migration.
+        let store = ClaudeEnvStore::new(&db);
+        store.initialize().unwrap();
+        // Main.rs calls perform_initial_backup right after initialize(); mirror
+        // that here so the test exercises the full upgrade flow.
+        store.perform_initial_backup().unwrap();
+
+        let connection = Connection::open(&db).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            4
+        );
+        assert!(!exists(&connection, "claude_settings_snapshots"));
+        let flag: String = connection
+            .query_row(
+                "SELECT value FROM settings WHERE key='initial_backup_done'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(flag, "1");
+        assert_eq!(
+            fs::read_to_string(config_dir.join("settings.json.cowboy-backup")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn v3_to_v4_migration_removes_snapshot_journal_kind() {
+        let temp = tempdir().unwrap();
+        let db = temp.path().join("cowboy.db");
+        let connection = Connection::open(&db).unwrap();
+
+        connection
+            .execute_batch(
+                "PRAGMA user_version = 3;
+                 CREATE TABLE settings(id INTEGER PRIMARY KEY, key TEXT NOT NULL UNIQUE, value TEXT NOT NULL);
+                 CREATE TABLE themes(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, is_active INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE claude_profiles(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, settings_json TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+                 CREATE TABLE claude_settings_snapshots(id INTEGER PRIMARY KEY, captured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, source TEXT, settings_json TEXT NOT NULL);
+                 CREATE TABLE profile_activation_journal(id INTEGER PRIMARY KEY CHECK (id = 1), target_kind TEXT NOT NULL, target_id TEXT NOT NULL, target_name TEXT, target_json_hash TEXT NOT NULL, phase TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+                 CREATE TABLE project_profile_bindings(project_cwd TEXT PRIMARY KEY, profile_name TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (profile_name) REFERENCES claude_profiles(name) ON DELETE RESTRICT);",
+            )
+            .unwrap();
+
+        drop(connection);
+
+        let store = ClaudeEnvStore::new(&db);
+        store.initialize().unwrap();
+
+        let connection = Connection::open(&db).unwrap();
+        // The new schema's CHECK should reject the old 'snapshot' kind.
+        let result = connection.execute(
+            "INSERT INTO profile_activation_journal \
+             (id,target_kind,target_id,target_name,target_json_hash,phase) \
+             VALUES (1,'snapshot','1',NULL,'abc','prepared')",
+            [],
+        );
+        assert!(
+            result.is_err(),
+            "expected CHECK constraint to reject 'snapshot' kind after v4 migration"
+        );
+        // And target_name must be NOT NULL.
+        let result = connection.execute(
+            "INSERT INTO profile_activation_journal \
+             (id,target_kind,target_id,target_name,target_json_hash,phase) \
+             VALUES (1,'profile','1',NULL,'abc','prepared')",
+            [],
+        );
+        assert!(
+            result.is_err(),
+            "expected NOT NULL constraint to reject NULL target_name after v4 migration"
+        );
     }
 }

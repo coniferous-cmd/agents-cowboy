@@ -25,7 +25,6 @@ pub(crate) enum ConfigCommand {
     Activate {
         name: String,
     },
-    History(HistoryCommand),
     Bind {
         project_path: String,
         profile_name: String,
@@ -37,15 +36,6 @@ pub(crate) enum ConfigCommand {
         source: String,
         new_name: String,
     },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum HistoryCommand {
-    List,
-    Show { id: i64 },
-    Activate { id: i64 },
-    Delete { id: i64 },
-    Prune { keep: usize },
 }
 
 pub(crate) fn parse_cli_args<I>(args: I) -> Result<CommandMode, String>

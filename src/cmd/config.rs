@@ -4,11 +4,10 @@ use cowboy::claude_env::ClaudeEnvStore;
 
 use cowboy::features::profile_editor::{edit_profile_json, EditOutcome};
 
-use super::{CommandMode, ConfigCommand, HistoryCommand};
+use super::{CommandMode, ConfigCommand};
 
 const CONFIG_USAGE: &str =
-    "Usage: cowboy config <list|create|edit|delete|activate|history|bind|unbind>";
-const HISTORY_USAGE: &str = "Usage: cowboy config history <list|show|activate|delete|prune>";
+    "Usage: cowboy config <list|create|edit|delete|activate|bind|unbind|copy>";
 
 pub(super) fn parse_config_args<I>(args: I) -> Result<CommandMode, String>
 where
@@ -62,52 +61,10 @@ where
             reject_extra(&mut args, "config copy <source> <new-name>")?;
             ConfigCommand::Copy { source, new_name }
         }
-        "history" => ConfigCommand::History(parse_history_args(args)?),
         unknown => return Err(format!("Unknown config command: {unknown}\n{CONFIG_USAGE}")),
     };
 
     Ok(CommandMode::Config(command))
-}
-
-fn parse_history_args<I>(args: I) -> Result<HistoryCommand, String>
-where
-    I: IntoIterator<Item = String>,
-{
-    let mut args = args.into_iter();
-    let Some(command) = args.next() else {
-        return Err(HISTORY_USAGE.to_string());
-    };
-
-    match command.as_str() {
-        "list" => {
-            reject_extra(&mut args, "config history list")?;
-            Ok(HistoryCommand::List)
-        }
-        "show" => Ok(HistoryCommand::Show {
-            id: parse_snapshot_id(exactly_one(&mut args, "config history show <id>")?)?,
-        }),
-        "activate" => Ok(HistoryCommand::Activate {
-            id: parse_snapshot_id(exactly_one(&mut args, "config history activate <id>")?)?,
-        }),
-        "delete" => Ok(HistoryCommand::Delete {
-            id: parse_snapshot_id(exactly_one(&mut args, "config history delete <id>")?)?,
-        }),
-        "prune" => {
-            let option = args
-                .next()
-                .ok_or_else(|| "Usage: cowboy config history prune --keep <n>".to_string())?;
-            if option != "--keep" {
-                return Err(format!("Unknown history prune option: {option}"));
-            }
-            let keep = exactly_one(&mut args, "config history prune --keep <n>")?
-                .parse::<usize>()
-                .map_err(|_| "--keep must be a non-negative integer".to_string())?;
-            Ok(HistoryCommand::Prune { keep })
-        }
-        unknown => Err(format!(
-            "Unknown config history command: {unknown}\n{HISTORY_USAGE}"
-        )),
-    }
 }
 
 fn exactly_one<I>(args: &mut I, usage: &str) -> Result<String, String>
@@ -129,13 +86,6 @@ where
         Err(format!("Unexpected argument for {command}: {extra}"))
     } else {
         Ok(())
-    }
-}
-
-fn parse_snapshot_id(raw: String) -> Result<i64, String> {
-    match raw.parse::<i64>() {
-        Ok(id) if id > 0 => Ok(id),
-        _ => Err("Snapshot id must be a positive integer".to_string()),
     }
 }
 
@@ -235,56 +185,6 @@ fn handle_config_with_writer<W: Write>(
                 .map_err(|error| format!("Failed to copy profile: {error}"))?;
             writeln!(output, "Copied profile '{}' to '{}'", source, copied.name)?;
         }
-        ConfigCommand::History(command) => handle_history(store, command, output)?,
-    }
-    Ok(())
-}
-
-fn handle_history<W: Write>(
-    store: &ClaudeEnvStore,
-    command: HistoryCommand,
-    output: &mut W,
-) -> Result<(), Box<dyn std::error::Error>> {
-    match command {
-        HistoryCommand::List => {
-            for snapshot in store
-                .list_snapshots()
-                .map_err(|error| format!("Failed to list settings history: {error}"))?
-            {
-                writeln!(
-                    output,
-                    "{}\t{}\t{} bytes\t{}",
-                    snapshot.id,
-                    snapshot.captured_at,
-                    snapshot.settings_json.len(),
-                    snapshot.source.as_deref().unwrap_or("-")
-                )?;
-            }
-        }
-        HistoryCommand::Show { id } => {
-            let snapshot = store
-                .snapshot(id)
-                .map_err(|error| format!("Failed to load snapshot {id}: {error}"))?;
-            writeln!(output, "{}", snapshot.settings_json)?;
-        }
-        HistoryCommand::Activate { id } => {
-            let path = store
-                .activate_snapshot(id)
-                .map_err(|error| format!("Failed to activate snapshot {id}: {error}"))?;
-            writeln!(output, "Activated snapshot {id} at {}", path.display())?;
-        }
-        HistoryCommand::Delete { id } => {
-            store
-                .delete_snapshot(id)
-                .map_err(|error| format!("Failed to delete snapshot {id}: {error}"))?;
-            writeln!(output, "Deleted snapshot: {id}")?;
-        }
-        HistoryCommand::Prune { keep } => {
-            let deleted = store
-                .prune_snapshots(keep)
-                .map_err(|error| format!("Failed to prune settings history: {error}"))?;
-            writeln!(output, "Pruned {deleted} snapshots; kept newest {keep}")?;
-        }
     }
     Ok(())
 }
@@ -292,7 +192,7 @@ fn handle_history<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::{handle_config_with_writer, parse_config_args};
-    use crate::cmd::{CommandMode, ConfigCommand, HistoryCommand};
+    use crate::cmd::{CommandMode, ConfigCommand};
     use cowboy::claude_env::ClaudeEnvStore;
 
     fn parse(args: &[&str]) -> Result<CommandMode, String> {
@@ -352,27 +252,15 @@ mod tests {
     }
 
     #[test]
-    fn parses_all_history_commands() {
-        assert_eq!(
-            parse(&["history", "list"]).unwrap(),
-            CommandMode::Config(ConfigCommand::History(HistoryCommand::List))
-        );
-        assert_eq!(
-            parse(&["history", "show", "42"]).unwrap(),
-            CommandMode::Config(ConfigCommand::History(HistoryCommand::Show { id: 42 }))
-        );
-        assert_eq!(
-            parse(&["history", "activate", "42"]).unwrap(),
-            CommandMode::Config(ConfigCommand::History(HistoryCommand::Activate { id: 42 }))
-        );
-        assert_eq!(
-            parse(&["history", "delete", "42"]).unwrap(),
-            CommandMode::Config(ConfigCommand::History(HistoryCommand::Delete { id: 42 }))
-        );
-        assert_eq!(
-            parse(&["history", "prune", "--keep", "0"]).unwrap(),
-            CommandMode::Config(ConfigCommand::History(HistoryCommand::Prune { keep: 0 }))
-        );
+    fn rejects_history_subcommand() {
+        for args in [
+            vec!["history"],
+            vec!["history", "list"],
+            vec!["history", "show", "1"],
+            vec!["history", "activate", "1"],
+        ] {
+            assert!(parse(&args).is_err(), "accepted invalid args: {args:?}");
+        }
     }
 
     #[test]
@@ -391,24 +279,8 @@ mod tests {
             vec!["copy"],
             vec!["copy", "work"],
             vec!["copy", "work", "work-debug", "extra"],
-            vec!["history"],
-            vec!["history", "unknown"],
-            vec!["history", "list", "extra"],
-            vec!["history", "prune", "10"],
-            vec!["history", "prune", "--keep"],
-            vec!["history", "prune", "--keep", "1", "extra"],
         ] {
             assert!(parse(&args).is_err(), "accepted invalid args: {args:?}");
-        }
-    }
-
-    #[test]
-    fn rejects_invalid_snapshot_ids_and_keep_counts() {
-        for id in ["0", "-1", "abc", "9223372036854775808"] {
-            assert!(parse(&["history", "show", id]).is_err());
-        }
-        for keep in ["-1", "abc"] {
-            assert!(parse(&["history", "prune", "--keep", keep]).is_err());
         }
     }
 
@@ -581,48 +453,6 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("profile already exists"));
-    }
-
-    #[test]
-    fn history_show_prints_snapshot_json_and_list_uses_byte_count() {
-        use cowboy::claude_env::Setting;
-
-        let (temp, store) = initialized_store();
-        let config_dir = temp.path().join("claude");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        std::fs::write(config_dir.join("settings.json"), "{\"秘密\":true}").unwrap();
-        store
-            .upsert_setting(&Setting {
-                key: "claude_config_dir".to_string(),
-                value: config_dir.display().to_string(),
-            })
-            .unwrap();
-        store.create_profile("work").unwrap();
-        store.activate_profile("work").unwrap();
-        let snapshot = store.list_snapshots().unwrap().remove(0);
-
-        let mut list_output = Vec::new();
-        handle_config_with_writer(
-            &store,
-            ConfigCommand::History(HistoryCommand::List),
-            &mut list_output,
-        )
-        .unwrap();
-        assert!(String::from_utf8(list_output)
-            .unwrap()
-            .contains(&format!("{} bytes", snapshot.settings_json.len())));
-
-        let mut show_output = Vec::new();
-        handle_config_with_writer(
-            &store,
-            ConfigCommand::History(HistoryCommand::Show { id: snapshot.id }),
-            &mut show_output,
-        )
-        .unwrap();
-        assert_eq!(
-            String::from_utf8(show_output).unwrap(),
-            format!("{}\n", snapshot.settings_json)
-        );
     }
 
     fn initialized_store() -> (tempfile::TempDir, ClaudeEnvStore) {
