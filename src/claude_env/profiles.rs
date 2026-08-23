@@ -182,18 +182,18 @@ impl ClaudeEnvStore {
         {
             let mut connection = self.connection()?;
             let transaction = connection.transaction()?;
-            match transaction.execute("DELETE FROM claude_profiles WHERE name=?1", [&name]) {
-                Ok(changed) => {
-                    if changed == 0 {
-                        return Err(StetsonError::ProfileNotFound(name));
+            let changed = transaction
+                .execute("DELETE FROM claude_profiles WHERE name=?1", [&name])
+                .map_err(|error| match error {
+                    rusqlite::Error::SqliteFailure(error, _)
+                        if error.code == rusqlite::ErrorCode::ConstraintViolation =>
+                    {
+                        StetsonError::ProfileInUse(name.clone())
                     }
-                }
-                Err(rusqlite::Error::SqliteFailure(error, _))
-                    if error.code == rusqlite::ErrorCode::ConstraintViolation =>
-                {
-                    return Err(StetsonError::ProfileInUse(name));
-                }
-                Err(error) => return Err(error.into()),
+                    error => error.into(),
+                })?;
+            if changed == 0 {
+                return Err(StetsonError::ProfileNotFound(name));
             }
             was_active = transaction.execute(
                 "DELETE FROM settings WHERE key=?1 AND value=?2",
