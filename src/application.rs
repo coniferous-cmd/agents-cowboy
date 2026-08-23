@@ -189,6 +189,20 @@ impl ClaudeCliLauncher {
     pub fn new(env_store: ClaudeEnvStore) -> Self {
         Self { env_store }
     }
+
+    /// If `cwd` has a profile binding whose settings file exists, append `--settings <path>`
+    /// to `command`. Silent on any error — profile binding is advisory.
+    fn apply_project_binding(&self, command: &mut Command, cwd: &Path) {
+        let Ok(Some(binding)) = self.env_store.project_binding(cwd) else {
+            return;
+        };
+        let Ok(profile_path) = self.env_store.profile_file_path(&binding.profile_name) else {
+            return;
+        };
+        if profile_path.exists() {
+            command.arg("--settings").arg(&profile_path);
+        }
+    }
 }
 
 impl ResumeLauncher for ClaudeCliLauncher {
@@ -203,13 +217,7 @@ impl ResumeLauncher for ClaudeCliLauncher {
             .arg(&target.key.native_id)
             .current_dir(&target.cwd);
 
-        if let Ok(Some(binding)) = self.env_store.project_binding(&target.cwd) {
-            if let Ok(profile_path) = self.env_store.profile_file_path(&binding.profile_name) {
-                if profile_path.exists() {
-                    command.arg("--settings").arg(&profile_path);
-                }
-            }
-        }
+        self.apply_project_binding(&mut command, &target.cwd);
 
         let status = command
             .status()
@@ -230,13 +238,7 @@ impl ResumeLauncher for ClaudeCliLauncher {
         let mut command = Command::new(&command_name);
         command.current_dir(cwd);
 
-        if let Ok(Some(binding)) = self.env_store.project_binding(cwd) {
-            if let Ok(profile_path) = self.env_store.profile_file_path(&binding.profile_name) {
-                if profile_path.exists() {
-                    command.arg("--settings").arg(&profile_path);
-                }
-            }
-        }
+        self.apply_project_binding(&mut command, cwd);
 
         let status = command
             .status()
