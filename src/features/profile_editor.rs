@@ -7,9 +7,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc;
-use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
@@ -42,8 +40,9 @@ pub enum EditOutcome {
 /// invalid JSON) are returned as the corresponding `EditOutcome` variant so the
 /// caller can decide how to surface them.
 ///
-/// The editor has a 60-second timeout.  If it exceeds this, the process is
-/// killed and `EditOutcome::EditorExitedWithError` is returned.
+/// The editor is allowed to run until it exits. This supports interactive
+/// editors and AI-assisted editors whose session can reasonably exceed a
+/// minute.
 pub fn edit_profile_json(raw_json: &str) -> Result<EditOutcome, String> {
     let editor = match std::env::var("EDITOR") {
         Ok(value) if !value.trim().is_empty() => value,
@@ -59,42 +58,14 @@ pub fn edit_profile_json(raw_json: &str) -> Result<EditOutcome, String> {
         )
     })?;
 
-    let child_id = child.id();
-
-    // Wait with timeout using a separate thread
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let result = child.wait();
-        let _ = tx.send(result);
-    });
-
-    // Wait for either editor exit or timeout (60 seconds)
-    let timeout = Duration::from_secs(60);
-    match rx.recv_timeout(timeout) {
-        Ok(Ok(status)) => {
-            // Editor exited (success or failure)
-            if !status.success() {
-                return Ok(EditOutcome::EditorExitedWithError(format!(
-                    "Editor exited with status {status}; edits preserved in {}",
-                    temp_path.display()
-                )));
-            }
-        }
-        Ok(Err(error)) => {
-            return Err(format!("Failed to wait for editor: {error}"));
-        }
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            // Timeout — kill the editor process
-            kill_process(child_id);
-            return Ok(EditOutcome::EditorExitedWithError(format!(
-                "Editor timed out after 60 seconds; edits preserved in {}",
-                temp_path.display()
-            )));
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            // Thread panicked — should not happen
-            return Err("Editor thread panicked unexpectedly".to_string());
-        }
+    let status = child
+        .wait()
+        .map_err(|error| format!("Failed to wait for editor: {error}"))?;
+    if !status.success() {
+        return Ok(EditOutcome::EditorExitedWithError(format!(
+            "Editor exited with status {status}; edits preserved in {}",
+            temp_path.display()
+        )));
     }
 
     let edited = fs::read_to_string(&temp_path)
@@ -180,30 +151,6 @@ fn spawn_editor(editor: &str, path: &Path) -> std::io::Result<std::process::Chil
     }
 }
 
-fn kill_process(child_id: u32) {
-    #[cfg(unix)]
-    {
-        // SAFETY: We're sending SIGTERM to a process we own
-        unsafe {
-            libc::kill(child_id as i32, libc::SIGTERM);
-        }
-    }
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::System::Threading::{
-            OpenProcess, TerminateProcess, PROCESS_TERMINATE,
-        };
-        // SAFETY: We're terminating a process we own
-        unsafe {
-            let handle = OpenProcess(PROCESS_TERMINATE, 0, child_id);
-            if !handle.is_null() {
-                TerminateProcess(handle, 1);
-                windows_sys::Win32::Foundation::CloseHandle(handle);
-            }
-        }
-    }
-}
-
 // ── Terminal-state wrapper for the TUI ───────────────────────────────────────
 //
 // Background: the prior three commits tried to fix garbled-TUI-after-editor
@@ -230,7 +177,7 @@ fn kill_process(child_id: u32) {
 ///   1. Snapshot terminal line discipline via `stty -g` (Unix).
 ///   2. Exit raw mode, leave the alternate screen, show the cursor.
 ///   3. Run the editor (delegates to the lower-level helper, preserving
-///      its 60 s timeout, JSON validation, and temp-file behavior).
+///      its wait-for-exit behavior, JSON validation, and temp-file behavior).
 ///   4. Write the reset escape sequences described in
 ///      [`write_terminal_reset_escapes`] — clears everything vim may
 ///      have switched (character set, SGR, mouse tracking, bracketed
@@ -412,6 +359,26 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn editor_waits_for_interactive_session_to_finish() {
+        let _guard = EDITOR_ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let editor = write_editor(
+            temp.path(),
+            "sleep 1\nprintf '{\"model\":\"opus\"}' > \"$1\"",
+        );
+        let previous = std::env::var_os("EDITOR");
+        std::env::set_var("EDITOR", &editor);
+        let outcome = edit_profile_json("{}").unwrap();
+        restore_editor(previous);
+
+        assert_eq!(
+            outcome,
+            EditOutcome::Saved("{\"model\":\"opus\"}".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn invalid_json_is_preserved_in_private_temp_file() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -454,28 +421,6 @@ mod tests {
             .expect("preserved path");
         assert_eq!(std::fs::read_to_string(path).unwrap(), "{\"before\":true}");
         std::fs::remove_file(path).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn editor_timeout_returns_error() {
-        let _guard = EDITOR_ENV_LOCK.lock().unwrap();
-        let temp = tempfile::tempdir().unwrap();
-        // Create an editor that sleeps for 120 seconds (longer than 60s timeout)
-        let editor = write_editor(temp.path(), "sleep 120");
-        let previous = std::env::var_os("EDITOR");
-        std::env::set_var("EDITOR", &editor);
-        let outcome = edit_profile_json("{}").unwrap();
-        restore_editor(previous);
-
-        let EditOutcome::EditorExitedWithError(message) = outcome else {
-            panic!("expected editor timeout error, got: {:?}", outcome);
-        };
-        assert!(
-            message.contains("timed out"),
-            "Expected timeout message, got: {}",
-            message
-        );
     }
 
     #[cfg(unix)]
