@@ -36,6 +36,9 @@ pub(crate) enum ConfigCommand {
         source: String,
         new_name: String,
     },
+    Sync {
+        name: Option<String>,
+    },
 }
 
 pub(crate) fn parse_cli_args<I>(args: I) -> Result<CommandMode, String>

@@ -7,7 +7,7 @@ use cowboy::features::profile_editor::{edit_profile_json, EditOutcome};
 use super::{CommandMode, ConfigCommand};
 
 const CONFIG_USAGE: &str =
-    "Usage: cowboy config <list|create|edit|delete|activate|bind|unbind|copy>";
+    "Usage: cowboy config <list|create|edit|delete|activate|bind|unbind|copy|sync>";
 
 pub(super) fn parse_config_args<I>(args: I) -> Result<CommandMode, String>
 where
@@ -60,6 +60,11 @@ where
                 .ok_or_else(|| "Usage: cowboy config copy <source> <new-name>".to_string())?;
             reject_extra(&mut args, "config copy <source> <new-name>")?;
             ConfigCommand::Copy { source, new_name }
+        }
+        "sync" => {
+            let name = args.next();
+            reject_extra(&mut args, "config sync [name]")?;
+            ConfigCommand::Sync { name }
         }
         unknown => return Err(format!("Unknown config command: {unknown}\n{CONFIG_USAGE}")),
     };
@@ -185,6 +190,23 @@ fn handle_config_with_writer<W: Write>(
                 .map_err(|error| format!("Failed to copy profile: {error}"))?;
             writeln!(output, "Copied profile '{}' to '{}'", source, copied.name)?;
         }
+        ConfigCommand::Sync { name } => {
+            let report = store
+                .sync_profiles_from_disk(name.as_deref())
+                .map_err(|error| format!("Failed to sync profiles: {error}"))?;
+            for entry in &report.inserted {
+                writeln!(output, "synced {entry}: inserted")?;
+            }
+            for entry in &report.updated {
+                writeln!(output, "synced {entry}: updated")?;
+            }
+            for entry in &report.unchanged {
+                writeln!(output, "synced {entry}: unchanged")?;
+            }
+            for entry in &report.invalid {
+                writeln!(output, "synced {}: invalid ({})", entry.name, entry.error)?;
+            }
+        }
     }
     Ok(())
 }
@@ -249,6 +271,16 @@ mod tests {
                 new_name: "work-debug".to_string()
             })
         );
+        assert_eq!(
+            parse(&["sync"]).unwrap(),
+            CommandMode::Config(ConfigCommand::Sync { name: None })
+        );
+        assert_eq!(
+            parse(&["sync", "work"]).unwrap(),
+            CommandMode::Config(ConfigCommand::Sync {
+                name: Some("work".to_string())
+            })
+        );
     }
 
     #[test]
@@ -279,6 +311,8 @@ mod tests {
             vec!["copy"],
             vec!["copy", "work"],
             vec!["copy", "work", "work-debug", "extra"],
+            vec!["sync", "work", "extra"],
+            vec!["sync", "work", "junk"],
         ] {
             assert!(parse(&args).is_err(), "accepted invalid args: {args:?}");
         }
@@ -460,5 +494,126 @@ mod tests {
         let store = ClaudeEnvStore::new(temp.path().join("cowboy.db"));
         store.initialize().unwrap();
         (temp, store)
+    }
+
+    fn write_profile_file(store: &ClaudeEnvStore, name: &str, body: &str) {
+        let path = store.profile_file_path(name).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body).unwrap();
+    }
+
+    // ── sync_handler tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn sync_handler_inserts_new_profile_from_disk_file() {
+        let (_temp, store) = initialized_store();
+        write_profile_file(&store, "newproj", r#"{"env":{"NEW":"1"}}"#);
+
+        let mut output = Vec::new();
+        handle_config_with_writer(
+            &store,
+            ConfigCommand::Sync {
+                name: Some("newproj".to_string()),
+            },
+            &mut output,
+        )
+        .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("synced newproj: inserted"));
+        assert!(store.profile("newproj").is_ok());
+    }
+
+    #[test]
+    fn sync_handler_updates_drifted_row() {
+        let (_temp, store) = initialized_store();
+        store.create_profile("work").unwrap();
+        store
+            .update_profile_json("work", r#"{"key":"old"}"#)
+            .unwrap();
+        write_profile_file(&store, "work", r#"{"key":"new"}"#);
+
+        let mut output = Vec::new();
+        handle_config_with_writer(
+            &store,
+            ConfigCommand::Sync {
+                name: Some("work".to_string()),
+            },
+            &mut output,
+        )
+        .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("synced work: updated"));
+        assert_eq!(
+            store.profile("work").unwrap().settings_json,
+            r#"{"key":"new"}"#
+        );
+    }
+
+    #[test]
+    fn sync_handler_reports_invalid_json_without_aborting() {
+        let (_temp, store) = initialized_store();
+        write_profile_file(&store, "broken", "trailing comma,");
+        write_profile_file(&store, "good", r#"{"k":1}"#);
+
+        let mut output = Vec::new();
+        let result =
+            handle_config_with_writer(&store, ConfigCommand::Sync { name: None }, &mut output);
+        assert!(result.is_ok());
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("synced broken: invalid"));
+        assert!(output.contains("synced good: inserted"));
+    }
+
+    #[test]
+    fn sync_handler_leaves_db_row_when_file_missing() {
+        let (_temp, store) = initialized_store();
+        store.create_profile("work").unwrap();
+        store
+            .update_profile_json("work", r#"{"key":"value"}"#)
+            .unwrap();
+        let file_path = store.profile_file_path("work").unwrap();
+        std::fs::remove_file(&file_path).unwrap();
+
+        let mut output = Vec::new();
+        handle_config_with_writer(&store, ConfigCommand::Sync { name: None }, &mut output).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(!output.contains("synced work"));
+        assert_eq!(
+            store.profile("work").unwrap().settings_json,
+            r#"{"key":"value"}"#
+        );
+    }
+
+    #[test]
+    fn sync_handler_writes_summary_with_outcome_keywords() {
+        let (_temp, store) = initialized_store();
+        store.create_profile("home").unwrap();
+        store.update_profile_json("home", r#"{"k":"v"}"#).unwrap();
+        write_profile_file(&store, "home", r#"{"k":"v"}"#);
+        write_profile_file(&store, "work", r#"{"k":"new"}"#);
+        write_profile_file(&store, "broken", "[1,2,3]");
+
+        let mut output = Vec::new();
+        handle_config_with_writer(&store, ConfigCommand::Sync { name: None }, &mut output).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("unchanged"));
+        assert!(output.contains("inserted"));
+        assert!(output.contains("invalid"));
+    }
+
+    #[test]
+    fn sync_handler_returns_ok_even_with_invalid_entries() {
+        let (_temp, store) = initialized_store();
+        write_profile_file(&store, "broken", "trailing comma,");
+
+        let mut output = Vec::new();
+        let result =
+            handle_config_with_writer(&store, ConfigCommand::Sync { name: None }, &mut output);
+        assert!(result.is_ok());
     }
 }

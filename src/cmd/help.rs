@@ -22,6 +22,7 @@ Config commands:
   config bind <project-path> <profile-name>
   config unbind <project-path>
   config copy <source> <new-name>
+  config sync [name]    Reconcile profiles from on-disk files into the database
 
 Options:
   -h, --help     Show this help message

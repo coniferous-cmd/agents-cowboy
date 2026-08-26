@@ -123,6 +123,7 @@ cowboy config list               # List settings Profiles
 cowboy config create <name>      # Create an empty Profile
 cowboy config edit <name>        # Edit a Profile with $EDITOR
 cowboy config activate <name>    # Activate a Profile
+cowboy config sync [name]        # Reconcile profile files on disk into the DB
 cowboy alias <command>           # Set Claude launcher alias
 cowboy install                   # Download & install latest Claude Code
 cowboy --help                    # Show help
@@ -170,6 +171,8 @@ Project and session discovery does not come from SQLite.
 ## Profiles and Environment
 
 Profiles store complete Claude Code settings JSON objects and atomically replace the configured global `settings.json` when activated. On the first launch that observes an existing `settings.json`, cowboy copies it to `settings.json.cowboy-backup` next to it so users always have a one-shot rollback point.
+
+Each profile is mirrored as `~/.config/cowboy/profiles/settings.<name>.json`. If you edit one of those files directly (for example with `vim`), the metadata in cowboy's SQLite database will be stale until you run `cowboy config sync [name]` to reconcile the file back into the database. With no argument, `cowboy config sync` reconciles every profile file on disk.
 
 New and resumed Claude processes inherit cowboy's current process environment unchanged; project/session environment overrides are no longer stored or injected.
 

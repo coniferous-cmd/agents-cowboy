@@ -61,6 +61,57 @@ pub fn validate_settings_json(raw: &str) -> Result<()> {
     Ok(())
 }
 
+/// Walk `profiles_dir` and return the `<name>` portion of every file that
+/// matches the pattern `settings.<name>.json`. The list is sorted
+/// alphabetically so callers can produce deterministic output. Files with
+/// names that do not match the pattern are silently ignored; their validation
+/// (if any) happens later in `reconcile_one`.
+fn discover_profile_names(profiles_dir: &Path) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in fs::read_dir(profiles_dir)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let Some(as_str) = file_name.to_str() else {
+            continue;
+        };
+        let Some(stripped) = as_str
+            .strip_prefix("settings.")
+            .and_then(|s| s.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        if stripped.is_empty() {
+            continue;
+        }
+        names.push(stripped.to_string());
+    }
+    names.sort();
+    Ok(names)
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SyncReport {
+    pub inserted: Vec<String>,
+    pub updated: Vec<String>,
+    pub unchanged: Vec<String>,
+    pub invalid: Vec<InvalidEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidEntry {
+    pub name: String,
+    pub error: String,
+}
+
+impl SyncReport {
+    pub fn is_empty(&self) -> bool {
+        self.inserted.is_empty()
+            && self.updated.is_empty()
+            && self.unchanged.is_empty()
+            && self.invalid.is_empty()
+    }
+}
+
 pub struct AtomicReplace;
 
 impl AtomicReplace {
@@ -244,6 +295,106 @@ impl ClaudeEnvStore {
         transaction.commit()?;
         drop(connection);
         self.profile(&new_name)
+    }
+
+    /// Reconcile profile files on disk into the `claude_profiles` SQLite table.
+    ///
+    /// When `name` is `None`, every `settings.<name>.json` in `profiles_dir()`
+    /// is processed (alphabetical order). When `name` is `Some`, only that one
+    /// file is processed (a missing file is a no-op).
+    ///
+    /// The disk is the source of truth: file content is read, validated, and
+    /// used to INSERT or UPDATE the matching database row. Rows that have no
+    /// corresponding file are left untouched. Files with non-conforming names
+    /// (or invalid JSON, or undecodable bytes) are recorded in
+    /// `SyncReport.invalid`; processing continues for the remaining files.
+    /// Sync never modifies the on-disk files or the `~/.claude/settings.json`
+    /// symlink.
+    pub fn sync_profiles_from_disk(&self, name: Option<&str>) -> Result<SyncReport> {
+        let mut report = SyncReport::default();
+        let candidates: Vec<String> = match name {
+            Some(raw) => vec![raw.to_string()],
+            None => discover_profile_names(&self.profiles_dir()?)?,
+        };
+        for candidate in candidates {
+            self.reconcile_one(&candidate, &mut report)?;
+        }
+        Ok(report)
+    }
+
+    /// Reconcile a single profile name against its on-disk file.
+    ///
+    /// The `raw_name` is the literal name as discovered (either from a
+    /// `settings.<name>.json` filename or from the explicit `sync` argument).
+    /// It is normalized via `validate_profile_name`; a normalization error
+    /// populates `report.invalid` and returns without further action.
+    fn reconcile_one(&self, raw_name: &str, report: &mut SyncReport) -> Result<()> {
+        let name = match validate_profile_name(raw_name) {
+            Ok(valid) => valid,
+            Err(error) => {
+                report.invalid.push(InvalidEntry {
+                    name: raw_name.to_string(),
+                    error: error.to_string(),
+                });
+                return Ok(());
+            }
+        };
+        let path = self.profile_file_path(&name)?;
+        let raw = match fs::read_to_string(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                report.invalid.push(InvalidEntry {
+                    name,
+                    error: format!("could not read file: {error}"),
+                });
+                return Ok(());
+            }
+        };
+        if let Err(error) = validate_settings_json(&raw) {
+            report.invalid.push(InvalidEntry {
+                name,
+                error: error.to_string(),
+            });
+            return Ok(());
+        }
+        let existing = self.profile(&name).ok();
+        match existing {
+            None => {
+                self.sync_write_profile_json(&name, &raw)?;
+                report.inserted.push(name);
+            }
+            Some(profile) if profile.settings_json == raw => {
+                report.unchanged.push(name);
+            }
+            Some(_) => {
+                self.sync_write_profile_json(&name, &raw)?;
+                report.updated.push(name);
+            }
+        }
+        Ok(())
+    }
+
+    /// Insert or update a profile row using only the database — without
+    /// touching the per-profile mirror file on disk. This is the sync-only
+    /// counterpart of `update_profile_json` and is used when the disk is
+    /// already authoritative and we just want the row to match.
+    fn sync_write_profile_json(&self, name: &str, settings_json: &str) -> Result<()> {
+        validate_settings_json(settings_json)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE claude_profiles SET settings_json=?1,updated_at=CURRENT_TIMESTAMP WHERE name=?2",
+            params![settings_json, name],
+        )?;
+        if changed == 0 {
+            transaction.execute(
+                "INSERT INTO claude_profiles (name,settings_json) VALUES (?1,?2)",
+                params![name, settings_json],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn perform_initial_backup(&self) -> Result<()> {
@@ -1696,5 +1847,204 @@ mod tests {
 
         let result = store.copy_profile("work", "invalid name");
         assert!(matches!(result, Err(StetsonError::InvalidProfileName(_))));
+    }
+
+    // ── sync_profiles_from_disk tests ───────────────────────────────────
+
+    fn write_profile_file(store: &ClaudeEnvStore, name: &str, body: &str) -> PathBuf {
+        let path = store.profile_file_path(name).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn sync_with_no_arg_returns_empty_report_when_profiles_dir_has_no_files() {
+        let (store, _temp, _config) = store();
+        store.create_profile("work").unwrap();
+
+        let report = store.sync_profiles_from_disk(None).unwrap();
+        assert!(report.is_empty());
+        assert!(report.inserted.is_empty());
+        assert!(report.updated.is_empty());
+        assert!(report.unchanged.is_empty());
+        assert!(report.invalid.is_empty());
+    }
+
+    #[test]
+    fn sync_ignores_non_conforming_files_in_profiles_dir() {
+        let (store, _temp, _config) = store();
+        let dir = store.profiles_dir().unwrap();
+        fs::write(dir.join("notes.txt"), "ignore me").unwrap();
+        fs::write(dir.join("settings..json"), "{}").unwrap();
+        fs::write(dir.join("settings..json.bak"), "{}").unwrap();
+        fs::write(dir.join("settings.work.json.bak"), "{}").unwrap();
+
+        let report = store.sync_profiles_from_disk(None).unwrap();
+        assert!(report.is_empty());
+        assert_eq!(store.list_profiles().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn sync_with_specific_name_does_not_touch_db_when_file_is_missing() {
+        let (store, _temp, _config) = store();
+        store.create_profile("work").unwrap();
+        store
+            .update_profile_json("work", r#"{"before":true}"#)
+            .unwrap();
+        // Remove the on-disk mirror so sync has nothing to reconcile.
+        let file_path = store.profile_file_path("work").unwrap();
+        fs::remove_file(&file_path).unwrap();
+
+        let report = store.sync_profiles_from_disk(Some("work")).unwrap();
+        assert!(report.is_empty());
+        let profile = store.profile("work").unwrap();
+        assert_eq!(profile.settings_json, r#"{"before":true}"#);
+    }
+
+    #[test]
+    fn sync_inserts_profile_from_disk_when_no_db_row() {
+        let (store, _temp, _config) = store();
+        write_profile_file(&store, "newproj", r#"{"env":{"NEW":"1"}}"#);
+
+        let report = store.sync_profiles_from_disk(None).unwrap();
+        assert_eq!(report.inserted, vec!["newproj".to_string()]);
+        let profile = store.profile("newproj").unwrap();
+        assert_eq!(profile.settings_json, r#"{"env":{"NEW":"1"}}"#);
+    }
+
+    #[test]
+    fn sync_updates_db_row_when_disk_differs() {
+        let (store, _temp, _config) = store();
+        store.create_profile("work").unwrap();
+        store
+            .update_profile_json("work", r#"{"key":"old"}"#)
+            .unwrap();
+        write_profile_file(&store, "work", r#"{"key":"new"}"#);
+
+        let report = store.sync_profiles_from_disk(None).unwrap();
+        assert_eq!(report.updated, vec!["work".to_string()]);
+        let profile = store.profile("work").unwrap();
+        assert_eq!(profile.settings_json, r#"{"key":"new"}"#);
+    }
+
+    #[test]
+    fn sync_no_ops_when_db_and_disk_match() {
+        let (store, _temp, _config) = store();
+        store.create_profile("work").unwrap();
+        store
+            .update_profile_json("work", r#"{"key":"value"}"#)
+            .unwrap();
+
+        let report = store.sync_profiles_from_disk(None).unwrap();
+        assert_eq!(report.unchanged, vec!["work".to_string()]);
+        assert!(report.inserted.is_empty());
+        assert!(report.updated.is_empty());
+    }
+
+    #[test]
+    fn sync_skips_invalid_json_and_returns_entry_in_report() {
+        let (store, _temp, _config) = store();
+        write_profile_file(&store, "broken_a", "trailing comma,");
+        write_profile_file(&store, "broken_b", "[1,2,3]");
+        write_profile_file(&store, "good", r#"{"k":1}"#);
+
+        let report = store.sync_profiles_from_disk(None).unwrap();
+        let invalid_names: Vec<&str> = report.invalid.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(invalid_names, vec!["broken_a", "broken_b"]);
+        assert!(!report.invalid[0].error.is_empty());
+        assert_eq!(report.inserted, vec!["good".to_string()]);
+    }
+
+    #[test]
+    fn sync_leaves_db_row_when_disk_file_missing() {
+        let (store, _temp, _config) = store();
+        store.create_profile("work").unwrap();
+        store
+            .update_profile_json("work", r#"{"key":"value"}"#)
+            .unwrap();
+        let file_path = store.profile_file_path("work").unwrap();
+        fs::remove_file(&file_path).unwrap();
+
+        let report = store.sync_profiles_from_disk(None).unwrap();
+        assert!(report.is_empty());
+        let profile = store.profile("work").unwrap();
+        assert_eq!(profile.settings_json, r#"{"key":"value"}"#);
+    }
+
+    #[test]
+    fn sync_walks_all_files_in_profiles_dir_when_called_with_none() {
+        let (store, _temp, _config) = store();
+        write_profile_file(&store, "alpha", r#"{"a":1}"#);
+        write_profile_file(&store, "beta", r#"{"b":2}"#);
+        write_profile_file(&store, "gamma", r#"{"g":3}"#);
+
+        let report = store.sync_profiles_from_disk(None).unwrap();
+        assert_eq!(
+            report.inserted,
+            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
+        );
+    }
+
+    #[test]
+    fn sync_only_targets_given_name_when_some() {
+        let (store, _temp, _config) = store();
+        write_profile_file(&store, "alpha", r#"{"a":1}"#);
+        write_profile_file(&store, "beta", r#"{"b":2}"#);
+
+        let report = store.sync_profiles_from_disk(Some("alpha")).unwrap();
+        assert_eq!(report.inserted, vec!["alpha".to_string()]);
+        assert!(store.profile("beta").is_err());
+    }
+
+    #[test]
+    fn sync_preserves_project_bindings() {
+        let (store, _temp, _config) = store();
+        store.create_profile("work").unwrap();
+        let cwd_a = PathBuf::from("/work/project-a");
+        let cwd_b = PathBuf::from("/work/project-b");
+        store.bind_profile(&cwd_a, "work").unwrap();
+        store.bind_profile(&cwd_b, "work").unwrap();
+        write_profile_file(&store, "work", r#"{"key":"new"}"#);
+
+        let _report = store.sync_profiles_from_disk(Some("work")).unwrap();
+        assert_eq!(store.profile_bindings("work").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn sync_with_invalid_name_format_in_filename_lands_in_invalid() {
+        let (store, _temp, _config) = store();
+        let dir = store.profiles_dir().unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("settings.Work With Space.json"), r#"{"ok":true}"#).unwrap();
+
+        let report = store.sync_profiles_from_disk(None).unwrap();
+        assert_eq!(report.invalid.len(), 1);
+        assert!(report.invalid[0].name.contains("Work With Space"));
+        assert!(report.invalid[0].error.to_lowercase().contains("name"));
+    }
+
+    #[test]
+    fn sync_with_binary_file_records_invalid_and_continues() {
+        let (store, _temp, _config) = store();
+        let dir = store.profiles_dir().unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("settings.binary.json"), [0xFF, 0xFE, 0xFD]).unwrap();
+        write_profile_file(&store, "good", r#"{"k":1}"#);
+
+        let report = store.sync_profiles_from_disk(None).unwrap();
+        assert_eq!(report.invalid.len(), 1);
+        assert_eq!(report.invalid[0].name, "binary");
+        assert_eq!(report.inserted, vec!["good".to_string()]);
+    }
+
+    #[test]
+    fn sync_handles_json_object_passing_through_validation_then_inserts() {
+        let (store, _temp, _config) = store();
+        write_profile_file(&store, "ok", r#"{"key":"value"}"#);
+
+        let report = store.sync_profiles_from_disk(Some("ok")).unwrap();
+        assert_eq!(report.inserted, vec!["ok".to_string()]);
+        assert!(report.invalid.is_empty());
     }
 }
