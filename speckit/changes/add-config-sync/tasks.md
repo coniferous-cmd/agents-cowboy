@@ -77,3 +77,18 @@
 - [ ] 8.1 写 commit message:`feat(profiles): add cowboy config sync subcommand to reconcile profiles from disk to DB`
 - [ ] 8.2 push 远端
 - [ ] 8.3 `/opsx:archive` 把本次 change 移到 `speckit/changes/archive/`
+
+## 9. Profile 文件不变量（TDD）
+
+- [x] 9.1 先在 `src/claude_env/profiles.rs` 增加失败测试：创建 profile
+  会生成 `{}` 镜像；镜像写入失败时数据库插入回滚；legacy DB-only profile
+  会补齐缺失镜像且不会覆盖已有文件。
+- [x] 9.2 最小修改 `create_profile`，使 SQLite 行与
+  `settings.<name>.json` 的创建成为同一成功条件；保持错误传播与事务回滚。
+- [x] 9.3 实现 legacy mirror 的非破坏性 backfill，并在合适的启动或
+  profile 操作边界调用；为该边界补隔离文件系统测试。
+- [x] 9.4 调整 sync 测试与文档，移除”缺失文件是允许的稳定状态”这一旧
+  假设，确认 sync 仍只执行文件→数据库同步。
+- [x] 9.5 运行 `cargo fmt --check`、`cargo test`、
+  `cargo clippy --all-targets --all-features -- -D warnings`，以及
+  `speckit validate --change add-config-sync`。

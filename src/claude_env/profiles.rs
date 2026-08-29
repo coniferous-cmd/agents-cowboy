@@ -175,19 +175,27 @@ impl ClaudeEnvStore {
 
     pub fn create_profile(&self, name: &str) -> Result<ClaudeProfile> {
         let name = validate_profile_name(name)?;
-        let connection = self.connection()?;
-        match connection.execute(
+        let target = self.profile_file_path(&name)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        match transaction.execute(
             "INSERT INTO claude_profiles (name,settings_json) VALUES (?1,'{}')",
             [&name],
         ) {
-            Ok(_) => self.profile(&name),
+            Ok(_) => {}
             Err(rusqlite::Error::SqliteFailure(error, _))
                 if error.code == rusqlite::ErrorCode::ConstraintViolation =>
             {
-                Err(StetsonError::ProfileExists(name))
+                return Err(StetsonError::ProfileExists(name));
             }
-            Err(error) => Err(error.into()),
+            Err(error) => return Err(error.into()),
         }
+        // On file-write failure the transaction is dropped without commit,
+        // rolling back the INSERT.
+        AtomicReplace::write(&target, b"{}")?;
+        transaction.commit()?;
+        drop(connection);
+        self.profile(&name)
     }
 
     pub fn profile(&self, name: &str) -> Result<ClaudeProfile> {
@@ -394,6 +402,21 @@ impl ClaudeEnvStore {
             )?;
         }
         transaction.commit()?;
+        Ok(())
+    }
+
+    /// Create missing mirror files for legacy database-only profiles.
+    ///
+    /// This is a non-destructive backfill: it only writes a mirror when none
+    /// exists. An existing file is treated as a potential external edit and is
+    /// left untouched; only an explicit `config sync` can reconcile it.
+    pub fn backfill_missing_mirrors(&self) -> Result<()> {
+        for profile in self.list_profiles()? {
+            let path = self.profile_file_path(&profile.name)?;
+            if !path.exists() {
+                AtomicReplace::write(&path, profile.settings_json.as_bytes())?;
+            }
+        }
         Ok(())
     }
 
@@ -1859,15 +1882,16 @@ mod tests {
     }
 
     #[test]
-    fn sync_with_no_arg_returns_empty_report_when_profiles_dir_has_no_files() {
+    fn sync_with_no_arg_returns_unchanged_when_only_mirror_matches_db() {
         let (store, _temp, _config) = store();
+        // create_profile now atomically writes the mirror file, so the
+        // profiles dir is never truly empty after a profile exists.
         store.create_profile("work").unwrap();
 
         let report = store.sync_profiles_from_disk(None).unwrap();
-        assert!(report.is_empty());
         assert!(report.inserted.is_empty());
         assert!(report.updated.is_empty());
-        assert!(report.unchanged.is_empty());
+        assert_eq!(report.unchanged, vec!["work".to_string()]);
         assert!(report.invalid.is_empty());
     }
 
@@ -1957,6 +1981,10 @@ mod tests {
     }
 
     #[test]
+    /// With the profile-file invariant, missing files are no longer a stable
+    /// state — `create_profile` and `backfill_missing_mirrors` ensure every
+    /// profile has a mirror. Sync still handles this edge case correctly by
+    /// leaving the DB untouched (sync is file→DB only, not a file creator).
     fn sync_leaves_db_row_when_disk_file_missing() {
         let (store, _temp, _config) = store();
         store.create_profile("work").unwrap();
@@ -2046,5 +2074,78 @@ mod tests {
         let report = store.sync_profiles_from_disk(Some("ok")).unwrap();
         assert_eq!(report.inserted, vec!["ok".to_string()]);
         assert!(report.invalid.is_empty());
+    }
+
+    // ── Profile file invariant tests (section 9) ──────────────────────
+
+    #[test]
+    fn create_profile_writes_empty_json_mirror_file() {
+        let (store, _temp, _config) = store();
+        store.create_profile("work").unwrap();
+        let path = store.profile_file_path("work").unwrap();
+        assert!(path.exists(), "mirror file should be created");
+        let contents = fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "{}");
+    }
+
+    #[test]
+    fn create_profile_rolls_back_db_insert_when_mirror_write_fails() {
+        let (store, _temp, _config) = store();
+        // Create a file at the profiles directory path so that
+        // ensure_private_dir (called by AtomicReplace::write) fails.
+        let profiles_dir = store.profiles_dir().unwrap();
+        fs::remove_dir_all(&profiles_dir).unwrap();
+        fs::write(&profiles_dir, b"block").unwrap();
+
+        let result = store.create_profile("work");
+        assert!(result.is_err(), "should fail when mirror cannot be written");
+        // The DB insert should have been rolled back.
+        assert!(
+            store.profile("work").is_err(),
+            "profile row should not exist after rollback"
+        );
+    }
+
+    #[test]
+    fn backfill_creates_missing_mirror_for_legacy_profile() {
+        let (store, _temp, _config) = store();
+        // Simulate a legacy DB-only profile by inserting directly into SQLite.
+        let conn = store.connection().unwrap();
+        conn.execute(
+            "INSERT INTO claude_profiles (name, settings_json) VALUES (?1, ?2)",
+            params!["legacy", r#"{"legacy":true}"#],
+        )
+        .unwrap();
+
+        let path = store.profile_file_path("legacy").unwrap();
+        assert!(!path.exists(), "no mirror file before backfill");
+
+        store.backfill_missing_mirrors().unwrap();
+
+        assert!(path.exists(), "mirror file should be created by backfill");
+        let contents = fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, r#"{"legacy":true}"#);
+    }
+
+    #[test]
+    fn backfill_does_not_overwrite_existing_mirror() {
+        let (store, _temp, _config) = store();
+        // Simulate a legacy profile whose file was edited externally.
+        let conn = store.connection().unwrap();
+        conn.execute(
+            "INSERT INTO claude_profiles (name, settings_json) VALUES (?1, ?2)",
+            params!["legacy", r#"{"db":"value"}"#],
+        )
+        .unwrap();
+        let path = store.profile_file_path("legacy").unwrap();
+        fs::write(&path, r#"{"disk":"different"}"#).unwrap();
+
+        store.backfill_missing_mirrors().unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            contents, r#"{"disk":"different"}"#,
+            "existing file must not be overwritten"
+        );
     }
 }
