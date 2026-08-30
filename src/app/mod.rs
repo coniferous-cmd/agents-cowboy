@@ -2719,11 +2719,8 @@ mod tests {
         app.handle_key(key_char('p'));
 
         assert_eq!(app.state.modal, ModalState::None);
-        assert!(app.state.should_quit);
-        assert_eq!(
-            app.state.pending_new_session,
-            Some(PathBuf::from("/work/repo"))
-        );
+        assert!(!app.state.should_quit);
+        assert_eq!(app.state.pending_new_session, None);
     }
 
     #[test]
