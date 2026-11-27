@@ -17,7 +17,7 @@ use cowboy::{
 };
 
 use crate::{
-    app::{DeleteCompletion, DeleteOutcome, DeleteTarget, InitialLoadCompletion, Stetson},
+    app::{DeleteCompletion, DeleteOutcome, DeleteTarget, LoadCompletion, LoadRequest, Stetson},
     application::{AgentBackend, ClaudeBackend, ClaudeCliLauncher, PiBackend, SessionRepository},
 };
 
@@ -61,6 +61,9 @@ fn initialize_env_store(
     Ok(env_store)
 }
 
+#[cfg(test)]
+use crate::app::InitialLoadCompletion;
+
 type WorkerBackend = std::sync::Arc<dyn AgentBackend + Send + Sync>;
 fn registered_backends(claude: ClaudeBackend, pi: PiBackend) -> (Stetson, Vec<WorkerBackend>) {
     let workers: Vec<WorkerBackend> = vec![
@@ -86,12 +89,18 @@ fn run_tui_app(env_store: ClaudeEnvStore) -> std::result::Result<(), Box<dyn Err
         app.set_theme(ThemePalette::from(&theme));
     }
 
-    let (initial_load_tx, initial_load_rx) = mpsc::channel::<InitialLoadCompletion>();
-    spawn_initial_load_worker(worker_backends[0].clone(), initial_load_tx);
+    app.enable_project_loading();
+    let (load_tx, load_rx) = mpsc::channel::<LoadCompletion>();
 
     loop {
         let mut terminal = enter_tui()?;
-        let tui_result = run_tui(&mut terminal, &mut app, &worker_backends, &initial_load_rx);
+        let tui_result = run_tui(
+            &mut terminal,
+            &mut app,
+            &worker_backends,
+            &load_tx,
+            &load_rx,
+        );
         let restore_result = leave_tui(&mut terminal);
 
         match (tui_result, restore_result) {
@@ -104,13 +113,13 @@ fn run_tui_app(env_store: ClaudeEnvStore) -> std::result::Result<(), Box<dyn Err
             if let Some(cwd) = app.take_pending_new_session() {
                 match app.selected_backend().launch_new(&cwd) {
                     Ok(()) => {
-                        app.resume_finished(format!(
-                            "Session exited, launched from {}",
-                            cwd.display()
-                        ));
+                        app.resume_finished_for(
+                            &cwd,
+                            format!("Session exited, launched from {}", cwd.display()),
+                        );
                     }
                     Err(error) => {
-                        app.resume_finished(format!("Failed to launch session: {error}"));
+                        app.resume_finished_for(&cwd, format!("Failed to launch session: {error}"));
                     }
                 }
                 continue;
@@ -120,17 +129,20 @@ fn run_tui_app(env_store: ClaudeEnvStore) -> std::result::Result<(), Box<dyn Err
 
         match app.selected_backend().resume(&target) {
             Ok(()) => {
-                app.resume_finished(format!(
-                    "{} exited: {}",
-                    app.selected_backend().label(),
-                    target.key.native_id
-                ));
+                app.resume_finished_for(
+                    &target.cwd,
+                    format!(
+                        "{} exited: {}",
+                        app.selected_backend().label(),
+                        target.key.native_id
+                    ),
+                );
             }
             Err(error) => {
-                app.resume_finished(format!(
-                    "Failed to resume session {}: {error}",
-                    target.key.native_id
-                ));
+                app.resume_finished_for(
+                    &target.cwd,
+                    format!("Failed to resume session {}: {error}", target.key.native_id),
+                );
             }
         }
     }
@@ -151,13 +163,22 @@ fn run_tui(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut Stetson,
     worker_backends: &[WorkerBackend],
-    initial_load_rx: &mpsc::Receiver<InitialLoadCompletion>,
+    load_tx: &mpsc::Sender<LoadCompletion>,
+    load_rx: &mpsc::Receiver<LoadCompletion>,
 ) -> std::result::Result<(), Box<dyn Error>> {
     let (delete_tx, delete_rx) = mpsc::channel::<DeleteCompletion>();
+    let render_clock = std::time::Instant::now();
 
     loop {
-        while let Ok(completion) = initial_load_rx.try_recv() {
-            app.complete_initial_load(completion);
+        while let Ok(completion) = load_rx.try_recv() {
+            app.complete_project_load(completion);
+        }
+        if let Some(request) = app.take_load_request() {
+            spawn_project_load_worker(
+                worker_backends[request.agent].clone(),
+                load_tx.clone(),
+                request,
+            );
         }
 
         // Drain any completed worker results and apply them to the app.
@@ -171,7 +192,8 @@ fn run_tui(
             spawn_delete_worker(worker_backends.to_vec(), delete_tx.clone(), target);
         }
 
-        terminal.draw(|frame| ui::render(frame, app.state()))?;
+        let tick = (render_clock.elapsed().as_millis() / 120) as usize;
+        terminal.draw(|frame| ui::render(frame, app.state(), app.load_feedback(), tick))?;
 
         // Check for a permitted exit only after processing worker results, so a
         // completion can unlock the UI before we test `should_quit`.
@@ -192,6 +214,24 @@ fn run_tui(
     }
 }
 
+fn spawn_project_load_worker(
+    backend: WorkerBackend,
+    sender: mpsc::Sender<LoadCompletion>,
+    request: LoadRequest,
+) {
+    let on_failure = request.clone();
+    let result_sender = sender.clone();
+    if let Err(error) = thread::Builder::new()
+        .name("cowboy-project-load".into())
+        .spawn(move || {
+            let _ = result_sender.send(request.run(backend.as_ref()));
+        })
+    {
+        let _ = sender.send(on_failure.failed(format!("Failed to start project load: {error}")));
+    }
+}
+
+#[cfg(test)]
 fn spawn_initial_load_worker<R>(repository: R, sender: mpsc::Sender<InitialLoadCompletion>)
 where
     R: SessionRepository + Send + 'static,
@@ -250,10 +290,7 @@ fn run_delete(repository: &dyn SessionRepository, target: &DeleteTarget) -> Dele
     };
 
     match result {
-        Ok(()) => match SessionRepository::load_projects(repository) {
-            Ok(projects) => DeleteOutcome::Success(projects),
-            Err(error) => DeleteOutcome::Failure(error),
-        },
+        Ok(()) => DeleteOutcome::Applied,
         Err(error) => DeleteOutcome::Failure(error),
     }
 }
@@ -326,19 +363,18 @@ mod startup_tests {
                     assert!(e.contains("unknown"));
                     assert!(dir.join("delete.jsonl").exists());
                 }
-                DeleteOutcome::Success(p) => {
+                DeleteOutcome::Applied => {
                     assert_eq!(agent, "pi");
-                    assert_eq!(p.len(), 1);
-                    assert_eq!(p[0].sessions.len(), 1);
-                    assert_eq!(p[0].sessions[0].native_id(), "keep");
+                    assert!(dir.join("keep.jsonl").exists());
                     assert!(!dir.join("delete.jsonl").exists());
                 }
+                DeleteOutcome::Success(_) => panic!("worker must not reload agent snapshots"),
             }
         }
     }
 
     #[test]
-    fn worker_calls_only_the_matching_backend_for_delete_and_reload() {
+    fn worker_calls_only_the_matching_backend_without_reloading_sessions() {
         use crate::application::{AppResult, ResumeLauncher};
         use cowboy::domain::AgentId;
         use std::sync::{Arc, Mutex};
@@ -389,10 +425,10 @@ mod startup_tests {
         );
         assert!(matches!(
             rx.recv_timeout(Duration::from_secs(5)).unwrap().outcome,
-            DeleteOutcome::Success(_)
+            DeleteOutcome::Applied
         ));
         assert!(claude.1.lock().unwrap().is_empty());
-        assert_eq!(*pi.1.lock().unwrap(), ["delete", "load"]);
+        assert_eq!(*pi.1.lock().unwrap(), ["delete"]);
     }
 
     struct BlockingRepository {

@@ -1,4 +1,5 @@
 mod project_actions;
+mod project_loading;
 mod session_actions;
 
 // ── Internal modules ─────────────────────────────────────────────────────────
@@ -47,7 +48,9 @@ mod state {
 
     #[derive(Debug)]
     pub enum DeleteOutcome {
-        /// Deletion succeeded; carries the freshly reloaded project list.
+        /// Deletion succeeded; refresh the affected project asynchronously.
+        Applied,
+        #[cfg(test)]
         Success(Vec<cowboy::domain::Project>),
         /// Deletion (or the reload after it) failed; carries an error message.
         Failure(String),
@@ -426,6 +429,10 @@ mod navigation {
             if index >= self.backends.len() {
                 return;
             }
+            if self.loading.is_some() {
+                self.switch_loading_agent(index);
+                return;
+            }
             let projects = if let Some(Some(cached)) = self.state.project_cache.get(index) {
                 cached.clone()
             } else {
@@ -463,6 +470,7 @@ mod navigation {
                         self.state.selected_project = next;
                         self.state.selected_session = 0;
                         self.state.status = format!("Project: {}", self.selected_project_label());
+                        self.retry_selected_project();
                     }
                 }
                 FocusPane::Sessions => {
@@ -676,6 +684,23 @@ mod modal {
                     };
 
                     let backend = self.selected_backend();
+                    if self.loading.is_some() {
+                        let cwd = self
+                            .current_session()
+                            .expect("session selected")
+                            .cwd
+                            .clone();
+                        match backend.rename_session(&session_key, &new_title) {
+                            Ok(()) => {
+                                self.state.modal = ModalState::None;
+                                self.state.input_buffer.clear();
+                                self.invalidate_project_sessions(&cwd);
+                                self.state.status = "Session renamed".into();
+                            }
+                            Err(error) => self.show_toast(error),
+                        }
+                        return;
+                    }
                     match backend
                         .rename_session(&session_key, &new_title)
                         .and_then(|()| backend.load_projects())
@@ -780,6 +805,7 @@ mod modal {
 #[cfg(test)]
 pub(crate) use state::build_session_info;
 
+pub(crate) use project_loading::{LoadCompletion, LoadFeedback, LoadRequest};
 pub use state::{
     AgentTab, AppState, DeleteCompletion, DeleteOutcome, DeleteTarget, FocusPane, ModalState,
     ResumeTarget, Toast,
@@ -787,9 +813,12 @@ pub use state::{
 
 // ── Stetson main impl ────────────────────────────────────────────────────────
 
-use crate::application::{AgentBackend, AppResult};
+use crate::application::AgentBackend;
+#[cfg(test)]
+use crate::application::AppResult;
 use std::path::PathBuf;
 
+#[cfg(test)]
 #[derive(Debug)]
 pub struct InitialLoadCompletion {
     pub projects: AppResult<Vec<cowboy::domain::Project>>,
@@ -798,6 +827,7 @@ pub struct InitialLoadCompletion {
 pub struct Stetson {
     backends: Vec<Box<dyn AgentBackend>>,
     state: AppState,
+    loading: Option<project_loading::ProjectLoading>,
 }
 
 impl Stetson {
@@ -815,7 +845,11 @@ impl Stetson {
             })
             .collect();
         state.project_cache = vec![None; backends.len()];
-        Self { backends, state }
+        Self {
+            backends,
+            state,
+            loading: None,
+        }
     }
 
     /// The backend of the currently selected agent tab.
@@ -881,6 +915,17 @@ impl Stetson {
         self.state.pending_delete = None;
 
         match completion.outcome {
+            DeleteOutcome::Applied => {
+                let cwd = match &completion.target {
+                    DeleteTarget::Project { cwd, .. } => Some(cwd.clone()),
+                    DeleteTarget::Session { .. } => self.current_project().map(|p| p.cwd.clone()),
+                };
+                if let Some(cwd) = cwd {
+                    self.refresh_project_catalog(&cwd);
+                }
+                self.state.status = completion.target.success_status();
+            }
+            #[cfg(test)]
             DeleteOutcome::Success(projects) => {
                 let target = completion.target;
                 self.replace_projects(projects, &target.success_status());
@@ -891,6 +936,7 @@ impl Stetson {
         }
     }
 
+    #[cfg(test)]
     pub fn complete_initial_load(&mut self, completion: InitialLoadCompletion) {
         match completion.projects {
             Ok(projects) => {
@@ -909,7 +955,16 @@ impl Stetson {
         }
     }
 
+    #[cfg(test)]
     pub fn resume_finished(&mut self, status: impl Into<String>) {
+        let cwd = self
+            .current_project()
+            .map(|project| project.cwd.clone())
+            .unwrap_or_default();
+        self.resume_finished_for(&cwd, status);
+    }
+
+    pub fn resume_finished_for(&mut self, cwd: &std::path::Path, status: impl Into<String>) {
         self.state.should_quit = false;
         self.state.pending_resume = None;
         self.state.pending_new_session = None;
@@ -918,6 +973,11 @@ impl Stetson {
         self.state.input_buffer.clear();
         self.state.delete_target = None;
 
+        if self.loading.is_some() {
+            self.refresh_project_catalog(cwd);
+            self.state.status = status.into();
+            return;
+        }
         match self.selected_backend().load_projects() {
             Ok(projects) => self.replace_projects(projects, &status.into()),
             Err(error) => self.show_toast(error),

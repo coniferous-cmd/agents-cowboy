@@ -9,7 +9,7 @@ use ratatui::{
 };
 
 use crate::{
-    app::{AgentTab, AppState, FocusPane, ModalState},
+    app::{AgentTab, AppState, FocusPane, LoadFeedback, ModalState},
     application::{session_key, session_title},
 };
 use cowboy::features::project_usage::{build_project_row_label, summarize_project_usage};
@@ -22,12 +22,12 @@ use self::colors::{
 use self::layout::{centered_rect, compute_main_layout, MainLayout};
 
 const OPEN_HERE_PROJECT_LABEL: &str = "Open Here";
-pub fn render(frame: &mut Frame, state: &AppState) {
+pub fn render(frame: &mut Frame, state: &AppState, feedback: LoadFeedback<'_>, tick: usize) {
     let layout = compute_main_layout(frame.area());
 
     render_agent_tabs(frame, state, layout.tabs);
     render_projects(frame, state, &layout);
-    render_sessions(frame, state, &layout);
+    render_sessions(frame, state, &layout, feedback, tick);
     render_status(frame, state, layout.status);
 
     match state.modal {
@@ -66,8 +66,12 @@ fn render_projects(frame: &mut Frame, state: &AppState, layout: &MainLayout) {
         .iter()
         .zip(display_names.iter())
         .map(|(project, name)| {
-            let summary = summarize_project_usage(project);
-            ListItem::new(build_project_row_label(name, &summary))
+            if project.sessions.is_empty() {
+                ListItem::new(name.clone())
+            } else {
+                let summary = summarize_project_usage(project);
+                ListItem::new(build_project_row_label(name, &summary))
+            }
         })
         .collect();
     items.push(ListItem::new(OPEN_HERE_PROJECT_LABEL));
@@ -90,14 +94,35 @@ fn render_projects(frame: &mut Frame, state: &AppState, layout: &MainLayout) {
     frame.render_stateful_widget(list, layout.projects, &mut list_state);
 }
 
-fn render_sessions(frame: &mut Frame, state: &AppState, layout: &MainLayout) {
-    let filtered_sessions = filter_project_sessions_for_agent(
-        state.projects.get(state.selected_project),
-        &state.search_query,
-        state.selected_agent_id(),
-    );
-    let items = if filtered_sessions.is_empty() {
-        vec![ListItem::new("No sessions")]
+fn render_sessions(
+    frame: &mut Frame,
+    state: &AppState,
+    layout: &MainLayout,
+    feedback: LoadFeedback<'_>,
+    tick: usize,
+) {
+    const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+    let spin = SPINNER[tick % SPINNER.len()];
+    let message = match feedback {
+        LoadFeedback::Ready => None,
+        LoadFeedback::Catalog => Some(format!("{spin} Discovering projects…")),
+        LoadFeedback::CatalogFailed(error) => Some(format!("Could not discover projects: {error}")),
+        LoadFeedback::Sessions => Some(format!("{spin} Loading sessions…")),
+        LoadFeedback::Failed(error) => Some(format!("Could not load sessions: {error}")),
+    };
+    let project = state.projects.get(state.selected_project);
+    let filtered_sessions =
+        filter_project_sessions_for_agent(project, &state.search_query, state.selected_agent_id());
+    let items = if let Some(message) = message {
+        vec![ListItem::new(message)]
+    } else if filtered_sessions.is_empty() {
+        let has_sessions = project.is_some_and(|p| !p.sessions.is_empty());
+        let empty = if has_sessions && !state.search_query.is_empty() {
+            "No matching sessions"
+        } else {
+            "No sessions"
+        };
+        vec![ListItem::new(empty)]
     } else {
         filtered_sessions
             .iter()
@@ -453,12 +478,57 @@ mod tests {
     /// Render the whole UI into an off-screen backend and return one string per
     /// terminal row, so tests assert on what the user actually sees.
     fn render_to_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
+        render_with_feedback_to_lines(state, LoadFeedback::Ready, 0, width, height)
+    }
+
+    fn render_with_feedback_to_lines(
+        state: &AppState,
+        feedback: LoadFeedback<'_>,
+        tick: usize,
+        width: u16,
+        height: u16,
+    ) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| render(frame, state)).unwrap();
+        terminal
+            .draw(|frame| render(frame, state, feedback, tick))
+            .unwrap();
         let buffer = terminal.backend().buffer();
         (0..height)
             .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
             .collect()
+    }
+
+    #[test]
+    fn unmatched_search_is_not_an_empty_project() {
+        let mut state = state_with_one_claude_session();
+        state.search_query = "not present".into();
+        let text = render_to_lines(&state, 98, 12).join("\n");
+        assert!(text.contains("No matching sessions"));
+        assert!(!text.contains("No sessions"));
+    }
+
+    #[test]
+    fn sessions_panel_animates_loading_and_distinguishes_empty_from_failure() {
+        use crate::app::LoadFeedback;
+        let mut state = state_with_one_claude_session();
+        state.projects[0].sessions.clear();
+        for (tick, glyph) in [(0, "⠋"), (1, "⠙")] {
+            let text = render_with_feedback_to_lines(&state, LoadFeedback::Sessions, tick, 98, 12)
+                .join("\n");
+            assert!(text.contains(&format!("{glyph} Loading sessions…")));
+            assert!(!text.contains("No sessions"));
+            assert!(!text.contains("repo-a (0) 0"));
+        }
+        let empty =
+            render_with_feedback_to_lines(&state, LoadFeedback::Ready, 2, 98, 12).join("\n");
+        assert!(empty.contains("No sessions"));
+        assert!(!empty.contains("Loading sessions"));
+        let failure =
+            render_with_feedback_to_lines(&state, LoadFeedback::Failed("read error"), 2, 98, 12)
+                .join("\n");
+        assert!(failure.contains("Could not load sessions: read error"));
+        assert!(!failure.contains("Loading sessions"));
+        assert!(!failure.contains("No sessions"));
     }
 
     fn state_with_one_claude_session() -> AppState {
@@ -556,7 +626,9 @@ mod tests {
         state.selected_agent = 1;
 
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
-        terminal.draw(|frame| render(frame, &state)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &state, LoadFeedback::Ready, 0))
+            .unwrap();
         let buffer = terminal.backend().buffer();
         let row: String = (0..80).map(|x| buffer[(x, 0)].symbol()).collect();
         let claude_x = row.find("Claude").expect("Claude tab rendered") as u16;

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::error::Error as StdError;
 use std::fmt;
 use std::path::PathBuf;
@@ -196,6 +197,9 @@ pub fn project_display_names(projects: &[Project]) -> Vec<String> {
         })
         .collect()
 }
+
+/// Logical project paths and the native session files associated with each path.
+pub type ProjectCatalog = BTreeMap<PathBuf, Vec<PathBuf>>;
 
 pub fn group_sessions_by_project(mut sessions: Vec<Session>) -> Vec<Project> {
     sessions.sort_by(|left, right| {

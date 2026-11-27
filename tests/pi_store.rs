@@ -28,6 +28,32 @@ fn msg(role: &str, fields: Value) -> Value {
     json!({"type":"message","timestamp":"2025-01-01T03:00:00Z","message":m})
 }
 #[test]
+fn discovers_supported_project_headers_without_parsing_other_sessions() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let alpha = root.join("alpha");
+    let zeta = root.join("zeta");
+    let broken = put(root, "same-storage-dir", "z", &[header("z", &zeta)]);
+    fs::write(&broken, format!("{}\ninvalid JSON", header("z", &zeta))).unwrap();
+    put(root, "same-storage-dir", "a", &[header("a", &alpha)]);
+    put(root, "other-storage-dir", "b", &[header("b", &alpha)]);
+    put(
+        root,
+        "unsupported",
+        "old",
+        &[json!({"type":"session","version":2})],
+    );
+
+    let store = PiProjectsStore::new(root);
+    let catalog = store.discover_projects().unwrap();
+    assert_eq!(catalog.keys().collect::<Vec<_>>(), vec![&alpha, &zeta]);
+    let project = store.load_project(&alpha, &catalog[&alpha]).unwrap();
+    assert_eq!(project.sessions.len(), 2);
+    assert!(project.sessions.iter().all(|session| session.cwd == alpha));
+    assert!(store.load_project(&zeta, &catalog[&zeta]).is_err());
+}
+
+#[test]
 fn parse_v3_stream_and_group_by_header() {
     let t = tempfile::tempdir().unwrap();
     let root = t.path();

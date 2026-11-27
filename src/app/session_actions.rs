@@ -70,11 +70,7 @@ impl Stetson {
                     return;
                 };
                 DeleteTarget::Project {
-                    agent_id: project
-                        .sessions
-                        .first()
-                        .map(|session| session.key.agent_id.clone())
-                        .unwrap_or_else(|| cowboy::domain::AgentId::new("claude").unwrap()),
+                    agent_id: self.selected_backend().id(),
                     name: project_name_owned(project),
                     cwd: project.cwd.clone(),
                 }

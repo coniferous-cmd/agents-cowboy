@@ -7,12 +7,49 @@ use serde_json::Value;
 use std::{
     fs::File,
     io::{BufRead, BufReader},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 pub(super) fn invalid(path: &Path, reason: impl std::fmt::Display) -> StetsonError {
     StetsonError::InvalidSessionFile(format!("{}: {reason}", path.display()))
 }
+fn parse_header(path: &Path, value: &Value) -> Result<Option<(SessionKey, PathBuf)>> {
+    if value["type"].as_str() != Some("session") {
+        return Err(invalid(path, "missing session header"));
+    }
+    let version = value["version"]
+        .as_u64()
+        .ok_or_else(|| invalid(path, "invalid session version"))?;
+    if version != 3 {
+        return Ok(None);
+    }
+    let field = |key| {
+        value[key]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| invalid(path, format!("missing {key}")))
+    };
+    let key = SessionKey::new(AgentId::new("pi").unwrap(), field("id")?)
+        .map_err(|error| invalid(path, error))?;
+    Ok(Some((key, field("cwd")?.into())))
+}
+
+fn parse_record(path: &Path, line: &str, index: usize) -> Result<Value> {
+    serde_json::from_str(line).map_err(|error| {
+        StetsonError::InvalidSessionFile(format!("{}:{}: {error}", path.display(), index + 1))
+    })
+}
+
+pub(super) fn discover_session_cwd(path: &Path) -> Result<Option<PathBuf>> {
+    for (i, line) in BufReader::new(File::open(path)?).lines().enumerate() {
+        let line = line?;
+        if !line.trim().is_empty() {
+            return Ok(parse_header(path, &parse_record(path, &line, i)?)?.map(|(_, cwd)| cwd));
+        }
+    }
+    Ok(None)
+}
+
 pub(super) fn parse(path: &Path) -> Result<Option<Session>> {
     let mut ts = TimestampRange::new();
     let mut key_cwd = None;
@@ -28,28 +65,13 @@ pub(super) fn parse(path: &Path) -> Result<Option<Session>> {
         if line.trim().is_empty() {
             continue;
         }
-        let v: Value = serde_json::from_str(&line).map_err(|e| {
-            StetsonError::InvalidSessionFile(format!("{}:{}: {e}", path.display(), i + 1))
-        })?;
+        let v = parse_record(path, &line, i)?;
         let kind = v["type"].as_str();
         if key_cwd.is_none() {
-            if kind != Some("session") {
-                return Err(invalid(path, "missing session header"));
-            }
-            let version = v["version"]
-                .as_u64()
-                .ok_or_else(|| invalid(path, "invalid session version"))?;
-            if version != 3 {
+            key_cwd = parse_header(path, &v)?;
+            if key_cwd.is_none() {
                 return Ok(None);
             }
-            let field = |k: &str| {
-                v[k].as_str()
-                    .filter(|s| !s.trim().is_empty())
-                    .ok_or_else(|| invalid(path, format!("missing {k}")))
-            };
-            let key = SessionKey::new(AgentId::new("pi").unwrap(), field("id")?)
-                .map_err(|e| invalid(path, e))?;
-            key_cwd = Some((key, field("cwd")?.into()));
         }
         if let Some(s) = v["timestamp"].as_str() {
             ts.consider(s);

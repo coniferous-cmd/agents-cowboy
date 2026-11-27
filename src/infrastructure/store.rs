@@ -1,10 +1,10 @@
-use crate::domain::{group_sessions_by_project, Project, Result, Session};
+use crate::domain::{group_sessions_by_project, Project, ProjectCatalog, Result, Session};
 use crate::encoding;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::parser::parse_session_file;
+use super::parser::{discover_session_cwd, parse_session_file};
 use super::project_paths::{default_claude_projects_dir, strip_windows_extended_prefix};
 use super::ClaudeProjectsStore;
 
@@ -23,8 +23,46 @@ impl ClaudeProjectsStore {
 
     pub fn discover_sessions(&self) -> Result<Vec<Session>> {
         let mut sessions = Vec::new();
+        self.visit_session_files(|path, hint| {
+            sessions.push(parse_session_file(&path, Some(hint))?);
+            Ok(())
+        })?;
+        Ok(sessions)
+    }
+
+    pub fn discover_projects(&self) -> Result<ProjectCatalog> {
+        let mut catalog = ProjectCatalog::new();
+        self.visit_session_files(|path, hint| {
+            let cwd = discover_session_cwd(&path, hint)?;
+            catalog.entry(cwd).or_default().push(path);
+            Ok(())
+        })?;
+        Ok(catalog)
+    }
+
+    pub fn load_project(&self, cwd: &Path, sources: &[PathBuf]) -> Result<Project> {
+        let mut sessions = Vec::new();
+        for path in sources {
+            let hint = path.parent().map(encoding::infer_cwd_from_project_dir_name);
+            let session = parse_session_file(path, hint.as_deref())?;
+            if session.cwd == cwd {
+                sessions.push(session);
+            }
+        }
+        Ok(group_sessions_by_project(sessions)
+            .pop()
+            .unwrap_or_else(|| Project {
+                cwd: cwd.to_path_buf(),
+                sessions: Vec::new(),
+            }))
+    }
+
+    fn visit_session_files(
+        &self,
+        mut visit: impl FnMut(PathBuf, &Path) -> Result<()>,
+    ) -> Result<()> {
         if !self.root.exists() {
-            return Ok(sessions);
+            return Ok(());
         }
 
         for project_entry in fs::read_dir(&self.root)? {
@@ -48,11 +86,11 @@ impl ClaudeProjectsStore {
                     continue;
                 }
 
-                sessions.push(parse_session_file(&session_path, Some(&project_hint))?);
+                visit(session_path, &project_hint)?;
             }
         }
 
-        Ok(sessions)
+        Ok(())
     }
 
     pub fn load_projects(&self) -> Result<Vec<Project>> {

@@ -2,9 +2,39 @@ use crate::domain::{Result, Session, SessionCapabilities, SessionKey, SessionUsa
 use crate::pricing;
 use serde_json::Value;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use super::timestamps::{collect_timestamps, TimestampRange};
+
+fn record_cwd(value: &Value) -> Option<PathBuf> {
+    find_first_string(
+        value,
+        &["cwd", "currentWorkingDirectory", "workingDirectory"],
+    )
+    .map(PathBuf::from)
+}
+
+fn resolve_cwd(cwd: Option<PathBuf>, project_hint: Option<&Path>) -> PathBuf {
+    match cwd {
+        Some(cwd) if cwd.is_absolute() => cwd,
+        other => project_hint
+            .map(Path::to_path_buf)
+            .or(other)
+            .unwrap_or_else(|| PathBuf::from(".")),
+    }
+}
+
+pub(super) fn discover_session_cwd(path: &Path, project_hint: &Path) -> Result<PathBuf> {
+    for line in BufReader::new(fs::File::open(path)?).lines() {
+        if let Ok(value) = serde_json::from_str::<Value>(&line?) {
+            if let Some(cwd) = record_cwd(&value) {
+                return Ok(resolve_cwd(Some(cwd), Some(project_hint)));
+            }
+        }
+    }
+    Ok(project_hint.to_path_buf())
+}
 
 pub(super) fn parse_session_file(
     session_path: &Path,
@@ -51,11 +81,7 @@ pub(super) fn parse_session_file(
             agent_title = find_title(&value, TitleKind::Agent);
         }
         if cwd.is_none() {
-            cwd = find_first_string(
-                &value,
-                &["cwd", "currentWorkingDirectory", "workingDirectory"],
-            )
-            .map(PathBuf::from);
+            cwd = record_cwd(&value);
         }
         if git_branch.is_none() {
             git_branch = find_first_string(&value, &["gitBranch", "branch"]);
@@ -95,13 +121,7 @@ pub(super) fn parse_session_file(
     let title = custom_title
         .or(agent_title)
         .unwrap_or_else(|| session_path_stem(session_path));
-    let cwd = match cwd {
-        Some(ref c) if c.is_absolute() => c.clone(),
-        _ => project_hint
-            .map(Path::to_path_buf)
-            .or(cwd)
-            .unwrap_or_else(|| PathBuf::from(".")),
-    };
+    let cwd = resolve_cwd(cwd, project_hint);
 
     let created_at = ts_range.created_at_string();
     let updated_at = ts_range.updated_at_string();

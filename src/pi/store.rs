@@ -1,6 +1,6 @@
-use super::parser::{invalid, parse};
+use super::parser::{discover_session_cwd, invalid, parse};
 use crate::{
-    domain::{validate_rename_title, SessionKey},
+    domain::{validate_rename_title, ProjectCatalog, SessionKey},
     group_sessions_by_project, Project, Result, Session, StetsonError,
 };
 use serde_json::{json, Value};
@@ -26,12 +26,48 @@ impl PiProjectsStore {
         ))
     }
     fn files(&self) -> Result<Vec<(PathBuf, Session)>> {
+        let mut out = Vec::new();
+        self.visit_session_files(|path| {
+            if let Some(session) = parse(&path)? {
+                out.push((path, session));
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    pub fn discover_projects(&self) -> Result<ProjectCatalog> {
+        let mut catalog = ProjectCatalog::new();
+        self.visit_session_files(|path| {
+            if let Some(cwd) = discover_session_cwd(&path)? {
+                catalog.entry(cwd).or_default().push(path);
+            }
+            Ok(())
+        })?;
+        Ok(catalog)
+    }
+
+    pub fn load_project(&self, cwd: &Path, sources: &[PathBuf]) -> Result<Project> {
+        let mut sessions = Vec::new();
+        for path in sources {
+            if let Some(session) = parse(path)?.filter(|session| session.cwd == cwd) {
+                sessions.push(session);
+            }
+        }
+        Ok(group_sessions_by_project(sessions)
+            .pop()
+            .unwrap_or_else(|| Project {
+                cwd: cwd.to_path_buf(),
+                sessions: Vec::new(),
+            }))
+    }
+
+    fn visit_session_files(&self, mut visit: impl FnMut(PathBuf) -> Result<()>) -> Result<()> {
         let dirs = match fs::read_dir(&self.root) {
             Ok(d) => d,
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(vec![]),
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e.into()),
         };
-        let mut out = Vec::new();
         for dir in dirs {
             let dir = dir?;
             if !dir.file_type()?.is_dir() {
@@ -41,13 +77,11 @@ impl PiProjectsStore {
                 let file = file?;
                 let path = file.path();
                 if file.file_type()?.is_file() && path.extension().is_some_and(|x| x == "jsonl") {
-                    if let Some(s) = parse(&path)? {
-                        out.push((path, s));
-                    }
+                    visit(path)?;
                 }
             }
         }
-        Ok(out)
+        Ok(())
     }
     pub fn discover_sessions(&self) -> Result<Vec<Session>> {
         Ok(self.files()?.into_iter().map(|(_, s)| s).collect())

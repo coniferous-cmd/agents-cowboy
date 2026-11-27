@@ -1,12 +1,13 @@
 use crate::domain::{Result, Session, StetsonError};
 use crate::encoding;
 use serde_json::{Map, Value};
-use std::ffi::OsStr;
+use std::collections::BTreeSet;
 use std::fs;
-use std::path::Path;
+use std::io::ErrorKind;
+use std::path::{Component, Path};
 
 use super::parser::{parse_session_file, set_title_in_value};
-use super::project_paths::{find_project_dir, remove_dir_if_exists};
+use super::project_paths::remove_dir_if_exists;
 use super::ClaudeProjectsStore;
 
 impl ClaudeProjectsStore {
@@ -87,32 +88,51 @@ impl ClaudeProjectsStore {
     }
 
     pub fn delete_project(&self, project_cwd: &Path) -> Result<()> {
-        let (project_dir, _) = find_project_dir(&self.root, project_cwd)?
-            .ok_or_else(|| StetsonError::ProjectNotFound(project_cwd.display().to_string()))?;
-
-        let mut sessions = Vec::new();
-        for session_entry in fs::read_dir(&project_dir)? {
-            let session_entry = session_entry?;
-            if !session_entry.file_type()?.is_file() {
-                continue;
+        let catalog = self.discover_projects()?;
+        let not_found = || StetsonError::ProjectNotFound(project_cwd.display().to_string());
+        let sources = catalog.get(project_cwd).ok_or_else(not_found)?;
+        let mut targets = Vec::new();
+        for path in sources {
+            let hint = encoding::parent_project_hint(path);
+            let session = parse_session_file(path, hint.as_deref())?;
+            if session.cwd == project_cwd {
+                let id = session.native_id();
+                let mut parts = Path::new(id).components();
+                if !matches!(parts.next(), Some(Component::Normal(part)) if part == id)
+                    || parts.next().is_some()
+                    || id.contains(['/', '\\', ':'])
+                    || id.ends_with(['.', ' '])
+                {
+                    return Err(StetsonError::InvalidSessionFile(format!(
+                        "Invalid Claude session ID in {}",
+                        path.display()
+                    )));
+                }
+                targets.push((path, session));
             }
-
-            let session_path = session_entry.path();
-            if session_path.extension() != Some(OsStr::new("jsonl")) {
-                continue;
-            }
-
-            sessions.push(parse_session_file(&session_path, Some(project_cwd))?);
+        }
+        if targets.is_empty() {
+            return Err(not_found());
         }
 
-        for session in sessions {
-            let source_location = session.source_location.as_deref().ok_or_else(|| {
-                StetsonError::InvalidSessionFile("Claude session has no source location".into())
-            })?;
-            self.delete_session(session.native_id(), source_location)?;
+        let mut parents = BTreeSet::new();
+        for (path, session) in targets {
+            self.delete_session(session.native_id(), path)?;
+            if let Some(parent) = path.parent() {
+                parents.insert(parent);
+            }
         }
-
-        remove_dir_if_exists(&project_dir)?;
+        for parent in parents {
+            match fs::remove_dir(parent) {
+                Ok(()) => (),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::DirectoryNotEmpty | ErrorKind::NotFound
+                    ) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         Ok(())
     }
 }

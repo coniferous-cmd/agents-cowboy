@@ -90,6 +90,46 @@ mod tests {
     }
 
     #[test]
+    fn discovers_logical_projects_without_parsing_unselected_history() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("history");
+        let mixed = root.join("-ambiguous-hyphen-name");
+        let second = root.join("-another-storage-directory");
+        fs::create_dir_all(&mixed).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let alpha = temp.path().join("alpha-repo");
+        let zeta = temp.path().join("zeta");
+        let fallback = crate::encoding::infer_cwd_from_project_dir_name(&mixed);
+        let meta = |cwd: &Path| serde_json::json!({"cwd": cwd});
+        fs::write(mixed.join("a.jsonl"), format!("{{}}\n{}", meta(&alpha))).unwrap();
+        fs::write(
+            mixed.join("z.jsonl"),
+            format!("{}\ninvalid JSON", meta(&zeta)),
+        )
+        .unwrap();
+        fs::write(mixed.join("missing.jsonl"), "{}").unwrap();
+        fs::write(second.join("b.jsonl"), meta(&alpha).to_string()).unwrap();
+
+        let store = ClaudeProjectsStore::new(root);
+        let catalog = store.discover_projects().unwrap();
+        let mut expected = vec![&alpha, &zeta, &fallback];
+        expected.sort();
+        assert_eq!(catalog.keys().collect::<Vec<_>>(), expected);
+        let project = store.load_project(&alpha, &catalog[&alpha]).unwrap();
+        assert_eq!(project.sessions.len(), 2);
+        assert!(project.sessions.iter().all(|session| session.cwd == alpha));
+        assert_eq!(
+            store
+                .load_project(&fallback, &catalog[&fallback])
+                .unwrap()
+                .sessions
+                .len(),
+            1
+        );
+        assert!(store.load_project(&zeta, &catalog[&zeta]).is_err());
+    }
+
+    #[test]
     fn from_home_uses_default_claude_projects_directory() {
         let store = ClaudeProjectsStore::from_home().unwrap();
         assert!(store
@@ -190,6 +230,47 @@ mod tests {
         assert!(!claude_root.join("file-history/session-6").exists());
         assert!(!claude_root.join("tasks/session-5").exists());
         assert!(!claude_root.join("tasks/session-6").exists());
+    }
+
+    #[test]
+    fn deletes_only_verified_project_members_across_storage_directories() {
+        let temp = tempdir().unwrap();
+        let claude_root = temp.path().join(".claude");
+        let root = claude_root.join("projects");
+        let mixed = root.join("mixed");
+        let second = root.join("second");
+        let alpha = temp.path().join("alpha");
+        let beta = temp.path().join("beta");
+        let write_session = |dir: &Path, id: &str, cwd: &Path| {
+            fs::create_dir_all(dir.join(id)).unwrap();
+            fs::create_dir_all(claude_root.join("tasks").join(id)).unwrap();
+            let path = dir.join(format!("{id}.jsonl"));
+            fs::write(
+                &path,
+                serde_json::json!({"sessionId": id, "cwd": cwd}).to_string(),
+            )
+            .unwrap();
+            path
+        };
+        let a1 = write_session(&mixed, "a1", &alpha);
+        let a2 = write_session(&second, "a2", &alpha);
+        let moved = write_session(&mixed, "moved", &alpha);
+        let b1 = write_session(&mixed, "b1", &beta);
+        let note = mixed.join("notes.txt");
+        fs::write(&note, "keep").unwrap();
+
+        let store = ClaudeProjectsStore::new(root);
+        assert_eq!(store.discover_projects().unwrap()[&alpha].len(), 3);
+        assert_eq!(write_session(&mixed, "moved", &beta), moved);
+        store.delete_project(&alpha).unwrap();
+
+        assert!(!a1.exists() && !a2.exists() && !second.exists());
+        assert!(!mixed.join("a1").exists());
+        assert!(!claude_root.join("tasks/a1").exists());
+        assert!(!claude_root.join("tasks/a2").exists());
+        assert!(moved.exists() && b1.exists() && note.exists());
+        assert!(mixed.join("moved").exists() && mixed.join("b1").exists());
+        assert!(claude_root.join("tasks/moved").exists() && claude_root.join("tasks/b1").exists());
     }
 
     #[test]
@@ -296,14 +377,15 @@ mod tests {
         fs::create_dir_all(&project_dir).unwrap();
 
         let session_path = project_dir.join("session.jsonl");
+        let cwd = temp.path().join("my-repo");
         fs::write(
             &session_path,
-            r#"{"type":"meta","sessionId":"s1","cwd":"/tmp/my-repo"}"#,
+            serde_json::json!({"type":"meta", "sessionId":"s1", "cwd":cwd}).to_string(),
         )
         .unwrap();
 
         let store = ClaudeProjectsStore::new(&projects_root);
-        store.delete_project(Path::new("/tmp/my-repo")).unwrap();
+        store.delete_project(&cwd).unwrap();
 
         assert!(!project_dir.exists());
     }

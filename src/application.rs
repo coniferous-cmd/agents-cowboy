@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cowboy::claude_env::ClaudeEnvStore;
-use cowboy::domain::{Project, Session, SessionKey};
+use cowboy::domain::{Project, ProjectCatalog, Session, SessionKey};
 use cowboy::infrastructure::ClaudeProjectsStore;
 
 use crate::app::ResumeTarget;
@@ -50,6 +50,19 @@ pub trait ResumeLauncher {
 pub trait AgentBackend: SessionRepository + ResumeLauncher {
     fn id(&self) -> cowboy::domain::AgentId;
     fn label(&self) -> &str;
+
+    #[cfg(not(test))]
+    fn discover_projects(&self) -> AppResult<ProjectCatalog>;
+    #[cfg(test)]
+    fn discover_projects(&self) -> AppResult<ProjectCatalog> {
+        unreachable!("legacy test backend does not support discovery")
+    }
+    #[cfg(not(test))]
+    fn load_project(&self, cwd: &Path, sources: &[PathBuf]) -> AppResult<Project>;
+    #[cfg(test)]
+    fn load_project(&self, _cwd: &Path, _sources: &[PathBuf]) -> AppResult<Project> {
+        unreachable!("legacy test backend does not support targeted loading")
+    }
 }
 
 /// The Claude strategy: composes the existing store and launcher so the
@@ -104,6 +117,18 @@ impl AgentBackend for ClaudeBackend {
 
     fn label(&self) -> &str {
         "Claude"
+    }
+
+    fn discover_projects(&self) -> AppResult<ProjectCatalog> {
+        self.repository
+            .discover_projects()
+            .map_err(|error| error.to_string())
+    }
+
+    fn load_project(&self, cwd: &Path, sources: &[PathBuf]) -> AppResult<Project> {
+        self.repository
+            .load_project(cwd, sources)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -213,6 +238,18 @@ impl AgentBackend for PiBackend {
     }
     fn label(&self) -> &str {
         "Pi"
+    }
+
+    fn discover_projects(&self) -> AppResult<ProjectCatalog> {
+        self.repository
+            .discover_projects()
+            .map_err(|error| error.to_string())
+    }
+
+    fn load_project(&self, cwd: &Path, sources: &[PathBuf]) -> AppResult<Project> {
+        self.repository
+            .load_project(cwd, sources)
+            .map_err(|error| error.to_string())
     }
 }
 
