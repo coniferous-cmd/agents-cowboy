@@ -1522,21 +1522,9 @@ mod tests {
     }
 
     #[test]
-    fn project_row_summary_counts_only_selected_agent_sessions() {
-        let mut claude_session = session_for_agent("claude", "claude-1", "/work/mixed");
-        claude_session.usage = Some(cowboy::domain::SessionUsage {
-            input_tokens: 100,
-            output_tokens: 0,
-            cache_creation_tokens: 0,
-            cache_read_tokens: 0,
-        });
-        let mut codex_session = session_for_agent("codex", "codex-1", "/work/mixed");
-        codex_session.usage = Some(cowboy::domain::SessionUsage {
-            input_tokens: 999,
-            output_tokens: 0,
-            cache_creation_tokens: 0,
-            cache_read_tokens: 0,
-        });
+    fn project_rows_receive_only_selected_agent_sessions() {
+        let claude_session = session_for_agent("claude", "claude-1", "/work/mixed");
+        let codex_session = session_for_agent("codex", "codex-1", "/work/mixed");
         let mut app = app_with_projects(Vec::new());
 
         app.complete_initial_load(InitialLoadCompletion {
@@ -1546,10 +1534,9 @@ mod tests {
             )]),
         });
 
-        let summary =
-            cowboy::features::project_usage::summarize_project_usage(&app.state.projects[0]);
-        assert_eq!(summary.session_count, 1);
-        assert_eq!(summary.known_total, 100);
+        let sessions = &app.state.projects[0].sessions;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].key, SessionKey::claude("claude-1"));
     }
 
     // ── Tab-switch continuity ─────────────────────────────────────────────

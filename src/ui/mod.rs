@@ -12,7 +12,6 @@ use crate::{
     app::{AgentTab, AppState, FocusPane, LoadFeedback, ModalState},
     application::{session_key, session_title},
 };
-use cowboy::features::project_usage::{build_project_row_label, summarize_project_usage};
 use cowboy::features::session_list::{filter_project_sessions_for_agent, sessions_panel_title};
 
 use self::colors::{
@@ -64,13 +63,13 @@ fn render_projects(frame: &mut Frame, state: &AppState, layout: &MainLayout) {
     let mut items: Vec<ListItem> = state
         .projects
         .iter()
-        .zip(display_names.iter())
+        .zip(display_names)
         .map(|(project, name)| {
-            if project.sessions.is_empty() {
-                ListItem::new(name.clone())
+            let count = project.sessions.len();
+            if count == 0 {
+                ListItem::new(name)
             } else {
-                let summary = summarize_project_usage(project);
-                ListItem::new(build_project_row_label(name, &summary))
+                ListItem::new(format!("{name} ({count})"))
             }
         })
         .collect();
@@ -152,11 +151,6 @@ fn render_sessions(
                 {
                     spans.push(Span::styled(
                         format!("  ${total:.2}"),
-                        meta_text_style(&state.theme),
-                    ));
-                } else if let Some(usage) = &session.usage {
-                    spans.push(Span::styled(
-                        format!("  {}", format_token_count(usage.total_tokens())),
                         meta_text_style(&state.theme),
                     ));
                 }
@@ -517,7 +511,7 @@ mod tests {
                 .join("\n");
             assert!(text.contains(&format!("{glyph} Loading sessions…")));
             assert!(!text.contains("No sessions"));
-            assert!(!text.contains("repo-a (0) 0"));
+            assert!(!text.contains("repo-a (0)"));
         }
         let empty =
             render_with_feedback_to_lines(&state, LoadFeedback::Ready, 2, 98, 12).join("\n");
@@ -554,6 +548,28 @@ mod tests {
         state
     }
 
+    fn row_metadata<'a>(lines: &'a [String], title: &str) -> Option<&'a str> {
+        lines
+            .iter()
+            .find_map(|row| row.split_once(title))
+            .and_then(|(_, tail)| tail.split_once('│'))
+            .map(|(metadata, _)| metadata.trim())
+    }
+
+    #[test]
+    fn session_row_with_usage_but_no_cost_has_no_token_suffix() {
+        let mut state = state_with_one_claude_session();
+        state.search_query = "login".into();
+        state.projects[0].sessions[0].usage = Some(cowboy::domain::SessionUsage {
+            input_tokens: 12_345,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+        });
+        let lines = render_to_lines(&state, 100, 16);
+        assert_eq!(row_metadata(&lines, "Fix login"), Some("#abc"));
+    }
+
     #[test]
     fn reported_cost_precedes_estimate_in_row_and_details() {
         for origin in [None, Some(true), Some(false)] {
@@ -570,8 +586,17 @@ mod tests {
                 total: 0.013308,
                 from_provider,
             });
-            let row = render_to_lines(&state, 140, 70).join("\n");
-            assert!(row.contains(if origin.is_some() { "$0.01" } else { "$2.00" }));
+            s.usage = Some(cowboy::domain::SessionUsage {
+                input_tokens: 12_345,
+                output_tokens: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+            });
+            let lines = render_to_lines(&state, 140, 70);
+            assert_eq!(
+                row_metadata(&lines, "Fix login"),
+                Some(if origin.is_some() { "$0.01" } else { "$2.00" })
+            );
             let p = &state.projects[0];
             state.info = Some(crate::app::build_session_info(p, &p.sessions[0]));
             state.modal = ModalState::Info;
@@ -582,6 +607,56 @@ mod tests {
                 None => ("Est. Cost: $2.0000", "(estimate based on token usage)"),
             };
             assert!(text.contains(cost) && text.contains(label));
+        }
+    }
+
+    #[test]
+    fn session_info_distinguishes_token_breakdown_zero_and_unknown() {
+        use cowboy::domain::SessionUsage;
+
+        let mut state = state_with_one_claude_session();
+        state.modal = ModalState::Info;
+        let cases = [
+            (
+                Some(SessionUsage {
+                    input_tokens: 1_000,
+                    output_tokens: 200,
+                    cache_creation_tokens: 30,
+                    cache_read_tokens: 4,
+                }),
+                vec![
+                    "Input Tokens: 1.0K",
+                    "Output Tokens: 200",
+                    "Cache Write: 30",
+                    "Cache Read: 4",
+                    "Total Tokens: 1.2K",
+                ],
+                "Token Usage: Unknown",
+            ),
+            (
+                Some(SessionUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
+                }),
+                vec!["Total Tokens: 0"],
+                "Token Usage: Unknown",
+            ),
+            (None, vec!["Token Usage: Unknown"], "Total Tokens:"),
+        ];
+        for (usage, expected, absent) in cases {
+            let project = &mut state.projects[0];
+            project.sessions[0].usage = usage;
+            state.info = Some(crate::app::build_session_info(
+                project,
+                &project.sessions[0],
+            ));
+            let text = render_to_lines(&state, 140, 70).join("\n");
+            for line in expected {
+                assert!(text.contains(line), "missing: {line}");
+            }
+            assert!(!text.contains(absent), "unexpected: {absent}");
         }
     }
 
@@ -721,33 +796,33 @@ mod tests {
     }
 
     #[test]
-    fn projects_list_has_correct_order_of_items() {
-        use crate::app::AppState;
-        use ratatui::widgets::ListItem;
-
-        let mut state = AppState::default();
-        state.projects.push(cowboy::domain::Project {
-            cwd: std::path::PathBuf::from("/repo-a"),
+    fn project_rows_show_loaded_session_count_without_token_usage() {
+        let mut state = state_with_one_claude_session();
+        state.agent_tabs = vec![claude_tab()];
+        state.projects[0].sessions[0].usage = Some(cowboy::domain::SessionUsage {
+            input_tokens: 9_876,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+        });
+        state.projects[0].cwd = "/work/repo-a".into();
+        state.projects[0].sessions[0].cwd = "/work/repo-a".into();
+        state.projects.push(Project {
+            cwd: "/workspace/repo-a".into(),
             sessions: Vec::new(),
         });
 
-        let display_names = cowboy::project_display_names(&state.projects);
-        let items: Vec<ListItem> = state
-            .projects
+        let lines = render_to_lines(&state, 100, 16);
+        let projects: Vec<_> = lines
             .iter()
-            .zip(display_names.iter())
-            .map(|(project, name)| {
-                let summary = cowboy::features::project_usage::summarize_project_usage(project);
-                let label =
-                    cowboy::features::project_usage::build_project_row_label(name, &summary);
-                ListItem::new(label)
-            })
+            .filter_map(|line| line.strip_prefix('│')?.split_once('│'))
+            .map(|(cell, _)| cell.trim().trim_start_matches("> "))
+            .filter(|name| name.contains("repo-a") || *name == "Open Here")
             .collect();
-        assert_eq!(items.len(), 1);
-
-        // The final synthetic item is always "Open Here".
-        let _open_here = ListItem::new("Open Here");
-        assert_eq!(OPEN_HERE_PROJECT_LABEL, "Open Here");
+        assert_eq!(
+            projects,
+            ["work/repo-a (1)", "workspace/repo-a", "Open Here"]
+        );
     }
 
     // ── Timestamp formatting ────────────────────────────────────────────

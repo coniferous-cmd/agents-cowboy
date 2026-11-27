@@ -52,13 +52,13 @@ The Projects column SHALL list only directories with at least one session of the
 - **WHEN** a search query is active under a selected agent tab
 - **THEN** the Sessions column shows only that agent's sessions of the current project matching the query
 
-### Requirement: Token summaries follow the selected agent
+### Requirement: Project session counts follow the selected agent
 
-Project-row session counts and token summaries SHALL be computed from the selected agent's sessions only, using the existing shared four-component total and compact formatter. No cross-agent combined view SHALL be offered.
+Project rows SHALL count loaded sessions for the selected agent only and SHALL NOT calculate or show an aggregate token total. No cross-agent combined view SHALL be offered.
 
 #### Scenario: Mixed-agent project under one tab
-- **WHEN** a directory has 5 Claude sessions totaling 8.1K tokens and 3 sessions of another agent
-- **THEN** its row under the Claude tab shows the count and total of the 5 Claude sessions only
+- **WHEN** a directory has 5 loaded Claude sessions totaling 8.1K tokens and 3 sessions of another agent
+- **THEN** its row under the Claude tab shows `(5)` and no token total
 
 ### Requirement: Launch actions follow the selected tab
 

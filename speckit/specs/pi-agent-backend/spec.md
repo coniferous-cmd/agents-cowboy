@@ -57,7 +57,7 @@ The title SHALL resolve in order: the latest `session_info` record's `name`, the
 
 ### Requirement: Pi usage extraction maps into the shared four-component total
 
-The Pi parser SHALL sum assistant-message `usage` objects into the shared `SessionUsage`: `input` → input, `output` → output, `cacheWrite` → cache creation, `cacheRead` → cache read. The `reasoning` field SHALL NOT be counted. An assistant `usage` object counts as known usage even when all four components are zero. Summation, compact formatting, and per-agent token summaries SHALL reuse the existing shared domain logic unchanged.
+The Pi parser SHALL sum assistant-message `usage` objects into the shared `SessionUsage`: `input` → input, `output` → output, `cacheWrite` → cache creation, `cacheRead` → cache read. The `reasoning` field SHALL NOT be counted. An assistant `usage` object counts as known usage even when all four components are zero. Session token summation and compact formatting in Session Info SHALL continue to use the shared logic.
 
 #### Scenario: Usage sums across assistant records
 - **WHEN** two assistant records carry usage `{input: 100, output: 10, cacheRead: 5, cacheWrite: 2}` and `{input: 200, output: 20, cacheRead: 0, cacheWrite: 3}`
@@ -73,11 +73,11 @@ The Pi parser SHALL sum assistant-message `usage` objects into the shared `Sessi
 
 #### Scenario: No assistant usage means unknown
 - **WHEN** a pi session has no assistant usage objects
-- **THEN** usage is unknown and the row shows no token summary
+- **THEN** Session Info shows `Token Usage: Unknown`
 
 ### Requirement: Reported cost takes precedence over token-based estimation
 
-The session normalization contract SHALL allow a strategy to supply an optional reported cost (total plus a provider-origin flag). The Pi parser SHALL sum assistant `usage.cost.total` into the reported cost; the provider-origin flag SHALL be true only when every cost-bearing record has `totalFromProvider: true`. When a reported cost exists, the session row SHALL show its total and Session Info SHALL show `Cost: $X` with `(reported by provider)` when the flag is true and `(reported by pi)` otherwise. When no reported cost exists, the existing estimation path applies unchanged: `pricing.rs` estimate shown as `Est. Cost` with the estimate note, else token summary only. Claude sessions SHALL keep their current estimated-cost behavior.
+The session normalization contract SHALL allow a strategy to supply an optional reported cost (total plus a provider-origin flag). The Pi parser SHALL sum assistant `usage.cost.total` into the reported cost; the provider-origin flag SHALL be true only when every cost-bearing record has `totalFromProvider: true`. When a reported cost exists, the session row SHALL show its total and Session Info SHALL show `Cost: $X` with `(reported by provider)` when the flag is true and `(reported by pi)` otherwise. When no reported cost exists, the session row SHALL show the `pricing.rs` estimate if available, and Session Info SHALL show it as `Est. Cost` with the estimate note. If neither cost is available, the row SHALL show no cost or token count. Claude sessions SHALL keep their current estimated-cost behavior.
 
 #### Scenario: Pi session with reported cost
 - **WHEN** a pi session's cost records sum to 0.013308 with `totalFromProvider: false`
@@ -95,9 +95,10 @@ The session normalization contract SHALL allow a strategy to supply an optional 
 - **WHEN** a Claude session has usage and a known model
 - **THEN** Session Info still shows `Est. Cost` with `(estimate based on token usage)`
 
-#### Scenario: Pi session without cost falls back
+#### Scenario: Pi session without an available cost
 - **WHEN** a pi session has usage but no cost objects and its model matches no pricing entry
-- **THEN** the row shows the token summary and Session Info shows no cost line
+- **THEN** the row shows neither a cost nor a token count
+- **AND** Session Info shows the token breakdown and total, but no cost line
 
 ### Requirement: Pi launch and resume use the pi CLI contract
 
