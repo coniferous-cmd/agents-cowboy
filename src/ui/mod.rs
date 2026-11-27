@@ -59,19 +59,9 @@ fn render_agent_tabs(frame: &mut Frame, state: &AppState, area: ratatui::layout:
 }
 
 fn render_projects(frame: &mut Frame, state: &AppState, layout: &MainLayout) {
-    let display_names = cowboy::project_display_names(&state.projects);
-    let mut items: Vec<ListItem> = state
-        .projects
-        .iter()
-        .zip(display_names)
-        .map(|(project, name)| {
-            let count = project.sessions.len();
-            if count == 0 {
-                ListItem::new(name)
-            } else {
-                ListItem::new(format!("{name} ({count})"))
-            }
-        })
+    let mut items: Vec<ListItem> = cowboy::project_display_names(&state.projects)
+        .into_iter()
+        .map(ListItem::new)
         .collect();
     items.push(ListItem::new(OPEN_HERE_PROJECT_LABEL));
 
@@ -511,7 +501,7 @@ mod tests {
                 .join("\n");
             assert!(text.contains(&format!("{glyph} Loading sessions…")));
             assert!(!text.contains("No sessions"));
-            assert!(!text.contains("repo-a (0)"));
+            assert!(!text.contains("repo-a ("));
         }
         let empty =
             render_with_feedback_to_lines(&state, LoadFeedback::Ready, 2, 98, 12).join("\n");
@@ -796,7 +786,7 @@ mod tests {
     }
 
     #[test]
-    fn project_rows_show_loaded_session_count_without_token_usage() {
+    fn project_rows_show_the_name_only_without_count_or_token_usage() {
         let mut state = state_with_one_claude_session();
         state.agent_tabs = vec![claude_tab()];
         state.projects[0].sessions[0].usage = Some(cowboy::domain::SessionUsage {
@@ -819,9 +809,14 @@ mod tests {
             .map(|(cell, _)| cell.trim().trim_start_matches("> "))
             .filter(|name| name.contains("repo-a") || *name == "Open Here")
             .collect();
-        assert_eq!(
-            projects,
-            ["work/repo-a (1)", "workspace/repo-a", "Open Here"]
+        assert_eq!(projects, ["work/repo-a", "workspace/repo-a", "Open Here"]);
+        // A project row must not regain a trailing annotation: neither the
+        // loaded session count nor a token total.
+        assert!(
+            projects
+                .iter()
+                .all(|row| !row.contains('(') && !row.contains('K')),
+            "project rows carry annotations: {projects:?}"
         );
     }
 

@@ -178,11 +178,10 @@ If `settings.json` is a symlink to a legacy Profile file, **do not delete the ta
 
 ## UI Notes
 
-- Project rows show aggregate token usage across all sessions: `name (count) usage`
-- Aggregate total includes input, output, cache creation, and cache read tokens
-- Partial totals show `+` (e.g. `12.3K+`); wholly unknown totals show `Unknown`; empty projects show `0`
-- The `Open Here` row shows no token usage
-- Session token usage is shown inline with session metadata using compact `K` and `M` units when cost is unavailable
+- Project rows show the project name only: no session count and no token usage
+- Projects that share a directory name are shown as `parent/name` to disambiguate them
+- The `Open Here` row is a plain label with no decoration
+- Session rows show reported cost when available, otherwise estimated cost; when neither exists they show no cost and no token count
 - Session Info modal shows the selected session's four token categories and total using the same four-component definition
 - LLM token prices are maintained in `data/llm_pricing.json` as USD per million tokens, grouped by provider and model prefix
 - Default documented theme direction is `Dracula`
