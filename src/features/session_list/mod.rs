@@ -26,19 +26,50 @@ pub fn filter_project_sessions_for_agent<'a>(
         .collect()
 }
 
-pub fn sessions_panel_title(query: &str) -> String {
-    if query.is_empty() {
-        "Sessions".to_string()
-    } else {
-        format!("Sessions / {query}")
+/// Title of the sessions pane. `agent_label` is the active agent filter, or
+/// `None` when every agent is shown; the search query, if any, follows it.
+pub fn sessions_panel_title(agent_label: Option<&str>, query: &str) -> String {
+    let mut title = match agent_label {
+        Some(label) => format!("Sessions · {label}"),
+        None => "Sessions".to_string(),
+    };
+    if !query.is_empty() {
+        title.push_str(&format!(" / {query}"));
     }
+    title
 }
 
 #[cfg(test)]
 mod tests {
-    use super::filter_project_sessions;
+    use super::{filter_project_sessions, sessions_panel_title};
     use crate::domain::{Project, Session, SessionCapabilities, SessionKey};
     use std::path::PathBuf;
+
+    #[test]
+    fn panel_title_is_plain_sessions_without_filter_or_query() {
+        assert_eq!(sessions_panel_title(None, ""), "Sessions");
+    }
+
+    #[test]
+    fn panel_title_shows_the_agent_filter_when_not_searching() {
+        assert_eq!(
+            sessions_panel_title(Some("Claude"), ""),
+            "Sessions · Claude"
+        );
+    }
+
+    #[test]
+    fn panel_title_shows_the_query_without_an_agent_filter() {
+        assert_eq!(sessions_panel_title(None, "fix"), "Sessions / fix");
+    }
+
+    #[test]
+    fn panel_title_shows_the_agent_filter_and_query_when_searching() {
+        assert_eq!(
+            sessions_panel_title(Some("Claude"), "fix"),
+            "Sessions · Claude / fix"
+        );
+    }
 
     #[test]
     fn filters_sessions_by_title_and_id() {

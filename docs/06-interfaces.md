@@ -30,7 +30,7 @@ Without a configured alias the launcher defaults to `claude`.
 
 ## TUI state
 
-- `FocusPane`: `Projects` or `Sessions`; the top tabs reflect the current focus.
+- `FocusPane`: `Projects` or `Sessions`; the highlighted pane border and the status badge reflect the current focus.
 - `[` / `]`, `Tab`, and the left/right arrows toggle focus.
 
 ## Historical references

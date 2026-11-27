@@ -2,7 +2,7 @@
 
 `cowboy` is a Rust TUI for browsing and managing Claude Code sessions stored under `~/.claude/projects/`.
 
-The two-column browser shows Projects on the left and Sessions on the right, with status and keyboard hints at the bottom.
+The two-column browser fills the terminal from the top row: Projects on the left and Sessions on the right, with status and keyboard hints at the bottom. The focused pane's border is highlighted.
 
 ## Features
 
@@ -97,6 +97,7 @@ whether the tag was created automatically or manually.
 | `r` | Rename session |
 | `Ctrl+D` | Delete project or session depending on focus; press `Ctrl+D` again in the confirmation dialog to confirm |
 | `/` | Search sessions |
+| `a` | Cycle the agent filter; the Sessions pane title shows it (`Sessions` = all agents, `Sessions · Claude` = Claude only) |
 | `q` / `Esc` | Quit |
 
 After confirming a deletion, cowboy keeps rendering while the filesystem

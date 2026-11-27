@@ -740,7 +740,7 @@ mod modal {
 // ── Public re-exports ────────────────────────────────────────────────────────
 
 pub use state::{
-    agent_filters, AppState, DeleteCompletion, DeleteOutcome, DeleteTarget, FocusPane, ModalState,
+    AgentFilter, AppState, DeleteCompletion, DeleteOutcome, DeleteTarget, FocusPane, ModalState,
     ResumeTarget, Toast,
 };
 
@@ -1110,7 +1110,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_tab_cycles_and_filters_sessions_in_the_current_project() {
+    fn agent_filter_cycles_and_filters_sessions_in_the_current_project() {
         let mut app = app_with_projects(vec![project(
             "/work/repo",
             vec![

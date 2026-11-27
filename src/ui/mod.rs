@@ -2,14 +2,14 @@ mod colors;
 mod layout;
 
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout},
+    layout::Alignment,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame,
 };
 
 use crate::{
-    app::{agent_filters, AppState, FocusPane, ModalState},
+    app::{AgentFilter, AppState, FocusPane, ModalState},
     application::{session_key, session_title},
 };
 use cowboy::features::project_usage::{build_project_row_label, summarize_project_usage};
@@ -25,7 +25,6 @@ const OPEN_HERE_PROJECT_LABEL: &str = "Open Here";
 pub fn render(frame: &mut Frame, state: &AppState) {
     let layout = compute_main_layout(frame.area());
 
-    render_tabs(frame, state, &layout);
     render_projects(frame, state, &layout);
     render_sessions(frame, state, &layout);
     render_status(frame, state, layout.status);
@@ -41,20 +40,6 @@ pub fn render(frame: &mut Frame, state: &AppState) {
         ModalState::DeleteConfirm => render_confirm_modal(frame, state),
         ModalState::None => {}
     }
-}
-
-fn render_tabs(frame: &mut Frame, state: &AppState, layout: &MainLayout) {
-    let selected = match state.focus {
-        FocusPane::Projects => 0,
-        FocusPane::Sessions => 1,
-    };
-    frame.render_widget(
-        Tabs::new(["Projects", "Sessions"])
-            .select(selected)
-            .divider(" | ")
-            .highlight_style(status_badge_style(&state.theme)),
-        layout.tabs,
-    );
 }
 
 fn render_projects(frame: &mut Frame, state: &AppState, layout: &MainLayout) {
@@ -89,28 +74,6 @@ fn render_projects(frame: &mut Frame, state: &AppState, layout: &MainLayout) {
 }
 
 fn render_sessions(frame: &mut Frame, state: &AppState, layout: &MainLayout) {
-    let areas = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
-        .split(layout.sessions);
-    let filters = agent_filters(&state.projects);
-    let selected_filter = filters
-        .iter()
-        .position(|filter| filter == &state.agent_filter)
-        .unwrap_or(0);
-    frame.render_widget(
-        Tabs::new(
-            filters
-                .iter()
-                .map(|filter| filter.label().to_string())
-                .collect::<Vec<_>>(),
-        )
-        .select(selected_filter)
-        .divider(" | ")
-        .highlight_style(status_badge_style(&state.theme)),
-        areas[0],
-    );
-
     let filtered_sessions = filter_project_sessions_for_agent(
         state.projects.get(state.selected_project),
         &state.search_query,
@@ -156,7 +119,13 @@ fn render_sessions(frame: &mut Frame, state: &AppState, layout: &MainLayout) {
             .collect()
     };
 
-    let title = sessions_panel_title(&state.search_query);
+    // The active agent filter lives in the pane title. "All" is the default
+    // and adds no suffix.
+    let agent_label = match &state.agent_filter {
+        AgentFilter::All => None,
+        AgentFilter::Agent(_) => Some(state.agent_filter.label()),
+    };
+    let title = sessions_panel_title(agent_label, &state.search_query);
 
     let block = Block::default()
         .title(title)
@@ -177,7 +146,7 @@ fn render_sessions(frame: &mut Frame, state: &AppState, layout: &MainLayout) {
     } else {
         Some(state.selected_session)
     });
-    frame.render_stateful_widget(list, areas[1], &mut list_state);
+    frame.render_stateful_widget(list, layout.sessions, &mut list_state);
 }
 
 fn render_status(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rect) {
@@ -453,6 +422,107 @@ fn format_token_count(value: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cowboy::domain::{AgentId, Project, Session, SessionCapabilities, SessionKey};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    /// Render the whole UI into an off-screen backend and return one string per
+    /// terminal row, so tests assert on what the user actually sees.
+    fn render_to_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| render(frame, state)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    fn state_with_one_claude_session() -> AppState {
+        let mut state = AppState::default();
+        state.projects.push(Project {
+            cwd: std::path::PathBuf::from("/repo-a"),
+            sessions: vec![Session {
+                key: SessionKey::claude("abc"),
+                title: "Fix login".into(),
+                cwd: std::path::PathBuf::from("/repo-a"),
+                git_branch: None,
+                created_at: None,
+                updated_at: None,
+                source_location: None,
+                message_count: None,
+                usage: None,
+                model: None,
+                estimated_cost: None,
+                capabilities: SessionCapabilities::default(),
+            }],
+        });
+        state
+    }
+
+    #[test]
+    fn top_row_shows_pane_borders_instead_of_focus_tabs() {
+        let state = state_with_one_claude_session();
+
+        let lines = render_to_lines(&state, 80, 20);
+
+        assert!(lines[0].starts_with("┌Projects"), "row 0: {:?}", lines[0]);
+        // The default "All" filter adds no suffix: the title is immediately
+        // followed by the border fill.
+        assert!(lines[0].contains("┌Sessions─"), "row 0: {:?}", lines[0]);
+    }
+
+    #[test]
+    fn sessions_title_stays_plain_when_searching_without_an_agent_filter() {
+        let mut state = state_with_one_claude_session();
+        state.search_query = "login".into();
+
+        let lines = render_to_lines(&state, 80, 20);
+
+        assert!(
+            lines[0].contains("┌Sessions / login─"),
+            "row 0: {:?}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn no_tab_strip_rows_are_rendered() {
+        let state = state_with_one_claude_session();
+
+        let screen = render_to_lines(&state, 80, 20).join("\n");
+
+        // ratatui's Tabs pads each label, so the strips read " Projects  |  Sessions ".
+        assert!(!screen.contains("Projects  |  Sessions"), "{screen}");
+        assert!(!screen.contains("All  |  Claude"), "{screen}");
+    }
+
+    #[test]
+    fn sessions_title_shows_the_active_agent_filter() {
+        let mut state = state_with_one_claude_session();
+        state.agent_filter = AgentFilter::Agent(AgentId::new("claude").unwrap());
+
+        let lines = render_to_lines(&state, 80, 20);
+
+        assert!(
+            lines[0].contains("Sessions · Claude"),
+            "row 0: {:?}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn sessions_title_shows_agent_filter_and_search_query() {
+        let mut state = state_with_one_claude_session();
+        state.agent_filter = AgentFilter::Agent(AgentId::new("claude").unwrap());
+        state.search_query = "login".into();
+
+        let lines = render_to_lines(&state, 80, 20);
+
+        assert!(
+            lines[0].contains("Sessions · Claude / login"),
+            "row 0: {:?}",
+            lines[0]
+        );
+    }
 
     #[test]
     fn test_format_token_count_raw() {
