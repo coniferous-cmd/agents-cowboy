@@ -2,11 +2,7 @@
 
 `cowboy` is a Rust TUI for browsing and managing Claude Code sessions stored under `~/.claude/projects/`.
 
-It presents three top-level tabs:
-
-- Projects and Sessions share the existing two-column session browser
-- Profiles lists named global settings
-- Bottom: status and keyboard hints
+The two-column browser shows Projects on the left and Sessions on the right, with status and keyboard hints at the bottom.
 
 ## Features
 
@@ -17,8 +13,6 @@ It presents three top-level tabs:
 - Delete a single session or an entire project group without blocking the TUI
 - Search sessions within the selected project
 - Inspect session metadata in a modal
-- Create and edit named Claude settings Profiles from the CLI
-- Atomically activate Profiles, with a one-shot backup of the prior `settings.json` written to `settings.json.cowboy-backup` on first launch
 
 ## Requirements
 
@@ -94,8 +88,7 @@ whether the tag was created automatically or manually.
 
 | Key | Action |
 |---|---|
-| `[` / `]` | Cycle Projects, Sessions, and Profiles tabs |
-| `Tab` / `←` / `→` | Toggle focus between Projects and Sessions |
+| `[` / `]` / `Tab` / `←` / `→` | Toggle focus between Projects and Sessions |
 | `↑` / `↓` | Move selection |
 | `Enter` in Projects | Start a new session in the selected project directory, or in the current working directory when `Open Here` is selected |
 | `Enter` in Sessions | Resume selected session |
@@ -104,8 +97,6 @@ whether the tag was created automatically or manually.
 | `r` | Rename session |
 | `Ctrl+D` | Delete project or session depending on focus; press `Ctrl+D` again in the confirmation dialog to confirm |
 | `/` | Search sessions |
-| `Enter` in Profiles | Activate the focused Profile |
-| `Ctrl+D` in Profiles | Delete the focused Profile; press `Ctrl+D` again to confirm |
 | `q` / `Esc` | Quit |
 
 After confirming a deletion, cowboy keeps rendering while the filesystem
@@ -119,11 +110,6 @@ list remains visible and the status bar reports the error.
 
 ```bash
 cowboy                    # Launch the TUI
-cowboy config list               # List settings Profiles
-cowboy config create <name>      # Create an empty Profile
-cowboy config edit <name>        # Edit a Profile with $EDITOR
-cowboy config activate <name>    # Activate a Profile
-cowboy config sync [name]        # Reconcile profile files on disk into the DB
 cowboy alias <command>           # Set Claude launcher alias
 cowboy install                   # Download & install latest Claude Code
 cowboy --help                    # Show help
@@ -164,23 +150,28 @@ After configuration, session resume should launch `my-claude --resume <session-i
 1. `~/.claude/projects/`
    Session and project source of truth. Session files are read and mutated directly from the filesystem.
 2. `~/.config/cowboy/cowboy.db`
-   SQLite metadata used for settings Profiles, launcher settings, and themes. On macOS this is under `~/Library/Application Support/cowboy/`.
+   SQLite metadata used for configurable paths, launcher settings, and themes. On macOS this is under `~/Library/Application Support/cowboy/`.
 
 Project and session discovery does not come from SQLite.
 
-## Profiles and Environment
+## Claude Settings and Environment
 
-Profiles store complete Claude Code settings JSON objects and atomically replace the configured global `settings.json` when activated. On the first launch that observes an existing `settings.json`, cowboy copies it to `settings.json.cowboy-backup` next to it so users always have a one-shot rollback point.
+New and resumed Claude processes inherit the current environment and load their own settings. Cowboy does not pass `--settings` or modify Claude's global `settings.json`.
 
-Each profile is mirrored as `~/.config/cowboy/profiles/settings.<name>.json`. If you edit one of those files directly (for example with `vim`), the metadata in cowboy's SQLite database will be stale until you run `cowboy config sync [name]` to reconcile the file back into the database. With no argument, `cowboy config sync` reconciles every profile file on disk.
+### Upgrading from a release with Profiles
 
-New and resumed Claude processes inherit cowboy's current process environment unchanged; project/session environment overrides are no longer stored or injected.
+`cowboy config` and project Profile bindings no longer work. Cowboy leaves old Profile files and database records, `settings.json`, and any `settings.json.cowboy-backup` untouched.
+
+If `settings.json` is a symlink to a legacy Profile file, **do not delete the target** while Claude still uses it. To keep the settings currently in effect and remove that dependency:
+
+1. Close Claude and copy the contents of the linked file to a new, private regular file in the same directory as `settings.json`. Verify that the copy has the expected settings and restrict its permissions to your account.
+2. Replace the `settings.json` symlink itself with that regular file. Do not copy over the existing symlink in place: that can write through to the target.
+3. Verify that Claude works with the new `settings.json` before removing any old Profile files. The old `settings.json.cowboy-backup` contains earlier settings; restoring it is a rollback, not a way to keep the currently effective settings.
 
 - On Windows, Claude project directories under `~/.claude/projects/` are resolved from session `cwd` data when the directory name is lossy or normalized differently from the workspace path.
 
 ## UI Notes
 
-- Projects and Sessions retain the two-column browser; Profiles is a separate tab
 - Project rows show aggregate token usage across all sessions: `name (count) usage`
 - Aggregate total includes input, output, cache creation, and cache read tokens
 - Partial totals show `+` (e.g. `12.3K+`); wholly unknown totals show `Unknown`; empty projects show `0`

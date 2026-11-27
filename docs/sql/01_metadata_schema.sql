@@ -1,3 +1,4 @@
+-- Historical version-1 schema. Current installations do not create Profile tables.
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS settings (

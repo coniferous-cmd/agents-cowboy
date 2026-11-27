@@ -7,11 +7,10 @@ use super::state::{
 };
 use super::Stetson;
 use crate::application::{
-    project_name_owned, session_key, session_title, ProfileRepository, ResumeLauncher,
-    SessionRepository,
+    project_name_owned, session_key, session_title, ResumeLauncher, SessionRepository,
 };
 
-impl<R: SessionRepository, L: ResumeLauncher, P: ProfileRepository> Stetson<R, L, P> {
+impl<R: SessionRepository, L: ResumeLauncher> Stetson<R, L> {
     pub fn filtered_sessions(&self) -> Vec<&Session> {
         filter_project_sessions_for_agent(
             self.current_project(),

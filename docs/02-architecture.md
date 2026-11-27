@@ -34,8 +34,8 @@ pricing rules, session parsing, or process-launch policy.
 
 ### Application
 
-- `src/application.rs` coordinates session repositories, launchers, and Profile activation.
-- `SessionRepository`, `ResumeLauncher`, and `ProfileRepository` are the primary application boundaries.
+- `src/application.rs` coordinates session repositories and process launching.
+- `SessionRepository` and `ResumeLauncher` are the primary application boundaries.
 - Application errors are converted into user-facing toast messages before
   returning control to the TUI.
 
@@ -58,12 +58,11 @@ pricing rules, session parsing, or process-launch policy.
   - `project_paths.rs` — project directory encoding and path matching
   - `mutation.rs` — rename and delete operations
 - `src/claude_env/` (directory module) owns the SQLite metadata store:
-  - `mod.rs` — Profile, setting, and theme types
-    module declarations, and tests
+  - `mod.rs` — setting and theme types and module declarations
   - `store.rs` — `ClaudeEnvStore` main implementation
   - `schema.rs` — versioned database schema, private legacy dump, and migration
   - `settings.rs` — `Setting` data, default paths, launcher alias
-  - `profiles.rs` — Profile repositories, activation journal, locking, permissions, and atomic replacement
+  - `files.rs` — private filesystem permissions and atomic replacement for metadata migration
   - `themes.rs` — theme CRUD and activation
 - `src/pricing.rs` loads the embedded pricing table from
   `data/llm_pricing.json`.
@@ -116,16 +115,14 @@ Success replaces the displayed list; failure preserves it and exposes the
 error. This protects normal application-level exit paths, not forced process
 termination.
 
-Launching Claude temporarily exits the alternate screen and raw mode. The CLI
-Profile editor runs `$EDITOR` outside the TUI. Profile activation uses the
-shared repository directly and reloads the Profiles view afterward.
+Launching Claude temporarily exits the alternate screen and raw mode. Claude loads its own settings; cowboy only provides the launcher, working directory, and resume arguments where applicable.
 
 ## Storage Boundaries
 
 ### Claude Filesystem
 
 - `~/.claude/projects/**/*.jsonl` is the source of truth for sessions.
-- The global `settings.json` is atomically replaced only by Profile activation.
+- Cowboy does not modify Claude's global `settings.json`.
 - Rename and delete operations mutate Claude-owned session data and companion
   sidecar directories.
 - Project discovery does not depend on SQLite.
@@ -134,9 +131,8 @@ shared repository directly and reloads the Profiles view afterward.
 
 - The default database is stored in the platform configuration directory for
   cowboy.
-- SQLite stores configurable paths, Profiles, journal state,
-  launcher settings, and themes.
-- SQL reference files live under `docs/sql/`.
+- SQLite stores configurable paths, launcher settings, and themes. Cowboy does not initialize, consume, or clean up retired Profile tables.
+- Historical SQL references live under `docs/sql/`.
 - SQLite must not become a second source of truth for session discovery.
 
 ## Session Discovery
@@ -169,22 +165,11 @@ rather than making the entire project list unavailable.
 New and resumed Claude processes inherit the parent process environment without
 project- or session-specific overrides from cowboy.
 
-## Profile Activation
+## Legacy Profile Data
 
-The `config edit` CLI validates edited content as a JSON object before updating
-SQLite. Profile activation serializes journal preparation in SQLite,
-atomically replaces the configured global settings file, then commits active
-state and clears the journal. A cross-process lock prevents CLI/TUI races; startup
-recovers a matching pending journal by hashing the exact target bytes.
-
-### First-Launch Backup
-
-On the first launch that observes an existing `settings.json`, the startup flow
-copies it to `<claude_config_dir>/settings.json.cowboy-backup` with mode 0600
-and persists an `initial_backup_done` flag in the `settings` table. Subsequent
-runs skip the copy regardless of whether the backup file still exists. The
-backup is the only rollback path now that the SQLite-backed snapshot history
-has been removed.
+Cowboy does not migrate or remove old Profile data, create settings backups, or
+recover old activation journals. See the [upgrade notes](../README.md#upgrading-from-a-release-with-profiles)
+for what to do if Claude's global settings still point to a legacy Profile file.
 
 ## Cross-Platform Constraints
 

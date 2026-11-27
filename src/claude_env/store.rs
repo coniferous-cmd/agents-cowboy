@@ -2,6 +2,7 @@ use crate::domain::{Result, StetsonError};
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
 
+use super::files::{ensure_private_dir, ensure_private_file, private_open};
 use super::schema::initialize_schema;
 use super::settings::{
     default_claude_config_dir, default_claude_projects_dir, default_metadata_db_path,
@@ -83,6 +84,15 @@ impl ClaudeEnvStore {
             .map_err(StetsonError::from)
     }
 
+    pub fn claude_config_dir(&self) -> Result<PathBuf> {
+        match self.get_setting(SETTING_CLAUDE_CONFIG_DIR)? {
+            Some(path) if !path.trim().is_empty() && Path::new(path.trim()).is_absolute() => {
+                Ok(PathBuf::from(path))
+            }
+            _ => default_claude_config_dir(),
+        }
+    }
+
     pub fn claude_projects_dir(&self) -> Result<PathBuf> {
         match self.get_setting(SETTING_CLAUDE_PROJECTS_DIR)? {
             Some(path) if !path.trim().is_empty() => Ok(PathBuf::from(path)),
@@ -99,15 +109,12 @@ impl ClaudeEnvStore {
 
     pub(super) fn connection(&self) -> Result<Connection> {
         if let Some(parent) = self.path.parent() {
-            super::profiles::ensure_private_dir(parent)?;
+            ensure_private_dir(parent)?;
         }
-        drop(super::profiles::private_open(&self.path)?);
-        super::profiles::ensure_private_file(&self.path)?;
+        drop(private_open(&self.path)?);
+        ensure_private_file(&self.path)?;
         for suffix in ["-wal", "-shm"] {
-            super::profiles::ensure_private_file(&PathBuf::from(format!(
-                "{}{suffix}",
-                self.path.display()
-            )))?;
+            ensure_private_file(&PathBuf::from(format!("{}{suffix}", self.path.display())))?;
         }
         let connection = Connection::open(&self.path)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;

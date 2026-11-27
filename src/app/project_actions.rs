@@ -2,9 +2,9 @@ use std::path::PathBuf;
 
 use super::state::FocusPane;
 use super::Stetson;
-use crate::application::{ProfileRepository, ResumeLauncher, SessionRepository};
+use crate::application::{ResumeLauncher, SessionRepository};
 
-impl<R: SessionRepository, L: ResumeLauncher, P: ProfileRepository> Stetson<R, L, P> {
+impl<R: SessionRepository, L: ResumeLauncher> Stetson<R, L> {
     pub fn activate_selection(&mut self) {
         match self.state.focus {
             FocusPane::Projects if self.is_open_here_selected() => self.new_session_here(),

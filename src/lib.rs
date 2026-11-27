@@ -6,9 +6,7 @@ pub mod infrastructure;
 pub mod pricing;
 pub mod theme;
 
-pub use claude_env::{
-    AtomicReplace, ClaudeEnvStore, ClaudeProfile, RecoveryOutcome, Setting, Theme,
-};
+pub use claude_env::{AtomicReplace, ClaudeEnvStore, Setting, Theme};
 pub use domain::{
     group_sessions_by_project, project_display_names, CostEstimate, Project, Result, Session,
     SessionUsage, StetsonError,

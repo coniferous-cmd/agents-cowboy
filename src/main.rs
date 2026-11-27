@@ -18,9 +18,7 @@ use cowboy::{
 
 use crate::{
     app::{DeleteCompletion, DeleteOutcome, DeleteTarget, InitialLoadCompletion, Stetson},
-    application::{
-        ClaudeCliLauncher, ProfileRepository, ResumeLauncher, SessionRepository, StetsonApplication,
-    },
+    application::{ClaudeCliLauncher, ResumeLauncher, SessionRepository, StetsonApplication},
 };
 
 fn main() {
@@ -37,43 +35,29 @@ fn run() -> std::result::Result<(), Box<dyn Error>> {
         cmd::print_help();
         return Ok(());
     }
-    let env_store = initialize_env_store()?;
+    let store = ClaudeEnvStore::from_home()
+        .map_err(|error| format!("Failed to initialize Claude env metadata path: {error}"))?;
+    let env_store = initialize_env_store(store)?;
 
     match command {
         cmd::CommandMode::Tui => run_tui_app(env_store),
         cmd::CommandMode::Help => Ok(()),
-        cmd::CommandMode::Config(command) => cmd::handle_config(&env_store, command),
         cmd::CommandMode::Alias(command) => cmd::handle_alias(&env_store, command),
     }
 }
 
-fn initialize_env_store() -> std::result::Result<ClaudeEnvStore, Box<dyn Error>> {
-    let env_store = ClaudeEnvStore::from_home()
-        .map_err(|error| format!("Failed to initialize Claude env metadata path: {error}"))?;
+fn initialize_env_store(
+    env_store: ClaudeEnvStore,
+) -> std::result::Result<ClaudeEnvStore, Box<dyn Error>> {
     env_store
         .initialize()
         .map_err(|error| format!("Failed to initialize Claude env metadata store: {error}"))?;
-    // Back up the existing settings.json once per cowboy install. The flag is
-    // written inside perform_initial_backup, so we never copy twice.
-    env_store
-        .perform_initial_backup()
-        .map_err(|error| format!("Failed to perform initial settings backup: {error}"))?;
     env_store
         .seed_default_settings()
         .map_err(|error| format!("Failed to seed cowboy settings: {error}"))?;
     env_store
         .seed_default_theme()
         .map_err(|error| format!("Failed to seed default theme: {error}"))?;
-    match env_store
-        .recover_profile_activation()
-        .map_err(|error| format!("Failed to recover profile activation: {error}"))?
-    {
-        cowboy::claude_env::RecoveryOutcome::Failed(error)
-        | cowboy::claude_env::RecoveryOutcome::PreviouslyFailed(error) => {
-            eprintln!("Warning: profile activation recovery failed: {error}");
-        }
-        _ => {}
-    }
     Ok(env_store)
 }
 
@@ -84,8 +68,7 @@ fn run_tui_app(env_store: ClaudeEnvStore) -> std::result::Result<(), Box<dyn Err
     let repository = ClaudeProjectsStore::new(projects_root);
     let worker_repository = repository.clone();
     let launcher = ClaudeCliLauncher::new(env_store.clone());
-    let application =
-        StetsonApplication::with_profiles(repository, launcher.clone(), env_store.clone());
+    let application = StetsonApplication::new(repository, launcher.clone());
     let mut app = Stetson::new(application);
 
     if let Ok(Some(theme)) = env_store.active_theme() {
@@ -93,11 +76,7 @@ fn run_tui_app(env_store: ClaudeEnvStore) -> std::result::Result<(), Box<dyn Err
     }
 
     let (initial_load_tx, initial_load_rx) = mpsc::channel::<InitialLoadCompletion>();
-    spawn_initial_load_worker(
-        worker_repository.clone(),
-        env_store.clone(),
-        initial_load_tx,
-    );
+    spawn_initial_load_worker(worker_repository.clone(), initial_load_tx);
 
     loop {
         let mut terminal = enter_tui()?;
@@ -117,13 +96,7 @@ fn run_tui_app(env_store: ClaudeEnvStore) -> std::result::Result<(), Box<dyn Err
 
         let Some(target) = app.take_pending_resume() else {
             if let Some(cwd) = app.take_pending_new_session() {
-                let override_path = app.take_pending_profile_override();
-                let launch_result = if let Some(profile_path) = override_path {
-                    launcher.launch_new_with_override(&cwd, &profile_path)
-                } else {
-                    launcher.launch_new(&cwd)
-                };
-                match launch_result {
+                match launcher.launch_new(&cwd) {
                     Ok(()) => {
                         app.resume_finished(format!(
                             "Session exited, launched from {}",
@@ -134,11 +107,6 @@ fn run_tui_app(env_store: ClaudeEnvStore) -> std::result::Result<(), Box<dyn Err
                         app.resume_finished(format!("Failed to launch session: {error}"));
                     }
                 }
-                continue;
-            }
-            if let Some(name) = app.take_pending_profile_edit() {
-                let outcome = app.run_new_profile_editor(&name);
-                app.profile_edit_finished(outcome);
                 continue;
             }
             break;
@@ -169,16 +137,15 @@ fn enter_tui() -> std::result::Result<Terminal<CrosstermBackend<io::Stdout>>, Bo
     Ok(Terminal::new(backend)?)
 }
 
-fn run_tui<R, L, P>(
+fn run_tui<R, L>(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &mut Stetson<R, L, P>,
+    app: &mut Stetson<R, L>,
     worker_repository: &ClaudeProjectsStore,
     initial_load_rx: &mpsc::Receiver<InitialLoadCompletion>,
 ) -> std::result::Result<(), Box<dyn Error>>
 where
     R: crate::application::SessionRepository,
     L: ResumeLauncher,
-    P: ProfileRepository,
 {
     let (delete_tx, delete_rx) = mpsc::channel::<DeleteCompletion>();
 
@@ -214,39 +181,27 @@ where
                     continue;
                 }
                 app.handle_key(key);
-                if app.take_terminal_refresh_request() {
-                    // An external editor changed the physical screen while
-                    // ratatui retained its previous-frame cache. Clear both so
-                    // the next draw repaints every cell.
-                    terminal.clear()?;
-                }
             }
         }
     }
 }
 
-fn spawn_initial_load_worker<R, P>(
-    repository: R,
-    profiles: P,
-    sender: mpsc::Sender<InitialLoadCompletion>,
-) where
+fn spawn_initial_load_worker<R>(repository: R, sender: mpsc::Sender<InitialLoadCompletion>)
+where
     R: SessionRepository + Send + 'static,
-    P: ProfileRepository + Send + 'static,
 {
     let error_sender = sender.clone();
     let spawn_result = thread::Builder::new()
         .name("cowboy-initial-load".to_string())
         .spawn(move || {
             let projects = repository.load_projects();
-            let profiles = (|| Ok((profiles.list_profiles()?, profiles.active_profile_name()?)))();
-            let _ = sender.send(InitialLoadCompletion { projects, profiles });
+            let _ = sender.send(InitialLoadCompletion { projects });
         });
 
     if let Err(error) = spawn_result {
         let message = format!("Failed to spawn initial load worker: {error}");
         let _ = error_sender.send(InitialLoadCompletion {
-            projects: Err(message.clone()),
-            profiles: Err(message),
+            projects: Err(message),
         });
     }
 }
@@ -281,7 +236,6 @@ fn run_delete(repository: &ClaudeProjectsStore, target: &DeleteTarget) -> Delete
     let result = match target {
         DeleteTarget::Project { cwd, .. } => SessionRepository::delete_project(repository, cwd),
         DeleteTarget::Session { key, .. } => SessionRepository::delete_session(repository, key),
-        DeleteTarget::Profile { .. } => Err("Profile deletion must run in the TUI".to_string()),
     };
 
     match result {
@@ -303,9 +257,11 @@ fn leave_tui(
 }
 
 #[cfg(test)]
+mod metadata_tests;
+
+#[cfg(test)]
 mod startup_tests {
     use super::*;
-    use crate::application::NoProfileRepository;
     use cowboy::domain::{Project, SessionKey};
     use std::path::Path;
     use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
@@ -346,7 +302,7 @@ mod startup_tests {
             release: release_rx,
         };
 
-        spawn_initial_load_worker(repository, NoProfileRepository, completion_tx);
+        spawn_initial_load_worker(repository, completion_tx);
 
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(matches!(completion_rx.try_recv(), Err(TryRecvError::Empty)));

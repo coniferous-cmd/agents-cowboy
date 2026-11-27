@@ -9,7 +9,7 @@ use ratatui::{
 };
 
 use crate::{
-    app::{agent_filters, AppState, FocusPane, MainTab, ModalState},
+    app::{agent_filters, AppState, FocusPane, ModalState},
     application::{session_key, session_title},
 };
 use cowboy::features::project_usage::{build_project_row_label, summarize_project_usage};
@@ -26,12 +26,8 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     let layout = compute_main_layout(frame.area());
 
     render_tabs(frame, state, &layout);
-    if state.main_tab == MainTab::Profiles {
-        render_profiles(frame, state, &layout);
-    } else {
-        render_projects(frame, state, &layout);
-        render_sessions(frame, state, &layout);
-    }
+    render_projects(frame, state, &layout);
+    render_sessions(frame, state, &layout);
     render_status(frame, state, layout.status);
 
     match state.modal {
@@ -43,32 +39,17 @@ pub fn render(frame: &mut Frame, state: &AppState) {
             render_input_modal(frame, "Search Sessions", &state.input_buffer, &state.theme)
         }
         ModalState::DeleteConfirm => render_confirm_modal(frame, state),
-        ModalState::NewProfile => {
-            render_input_modal(frame, "New Profile", &state.input_buffer, &state.theme)
-        }
-        ModalState::EditProfile { .. } => {
-            // Editor owns the terminal; no modal rendering needed
-        }
-        ModalState::BindProfile { profile_cursor } => {
-            render_bind_profile_modal(frame, state, profile_cursor)
-        }
-        ModalState::PickProfile { profile_cursor } => {
-            render_pick_profile_modal(frame, state, profile_cursor)
-        }
-        ModalState::CopyProfile => {
-            render_input_modal(frame, "Copy Profile", &state.input_buffer, &state.theme)
-        }
         ModalState::None => {}
     }
 }
 
 fn render_tabs(frame: &mut Frame, state: &AppState, layout: &MainLayout) {
-    let selected = match state.main_tab {
-        MainTab::Projects => 0,
-        MainTab::Profiles => 1,
+    let selected = match state.focus {
+        FocusPane::Projects => 0,
+        FocusPane::Sessions => 1,
     };
     frame.render_widget(
-        Tabs::new(["Projects", "Profiles"])
+        Tabs::new(["Projects", "Sessions"])
             .select(selected)
             .divider(" | ")
             .highlight_style(status_badge_style(&state.theme)),
@@ -82,18 +63,9 @@ fn render_projects(frame: &mut Frame, state: &AppState, layout: &MainLayout) {
         .projects
         .iter()
         .zip(display_names.iter())
-        .zip(state.project_bindings.iter())
-        .map(|((project, name), binding)| {
+        .map(|(project, name)| {
             let summary = summarize_project_usage(project);
-            let label = if let Some(profile_name) = binding {
-                format!(
-                    "[{profile_name}] {}",
-                    build_project_row_label(name, &summary)
-                )
-            } else {
-                build_project_row_label(name, &summary)
-            };
-            ListItem::new(label)
+            ListItem::new(build_project_row_label(name, &summary))
         })
         .collect();
     items.push(ListItem::new(OPEN_HERE_PROJECT_LABEL));
@@ -114,39 +86,6 @@ fn render_projects(frame: &mut Frame, state: &AppState, layout: &MainLayout) {
     let mut list_state = ratatui::widgets::ListState::default();
     list_state.select(Some(state.selected_project));
     frame.render_stateful_widget(list, layout.projects, &mut list_state);
-}
-
-fn render_profiles(frame: &mut Frame, state: &AppState, layout: &MainLayout) {
-    let profile_items = if state.profiles.is_empty() {
-        vec![ListItem::new(
-            "No profiles (use `cowboy config create <name>`)",
-        )]
-    } else {
-        state
-            .profiles
-            .iter()
-            .map(|profile| {
-                let active = if state.active_profile_name.as_deref() == Some(&profile.name) {
-                    " ●"
-                } else {
-                    ""
-                };
-                ListItem::new(format!("{}{active}", profile.name))
-            })
-            .collect()
-    };
-    let mut profile_state = ratatui::widgets::ListState::default();
-    if !state.profiles.is_empty() && state.profile_cursor < state.profiles.len() {
-        profile_state.select(Some(state.profile_cursor));
-    }
-    frame.render_stateful_widget(
-        List::new(profile_items)
-            .block(Block::default().title("Profiles").borders(Borders::ALL))
-            .highlight_style(project_highlight_style(&state.theme))
-            .highlight_symbol("> "),
-        layout.profiles,
-        &mut profile_state,
-    );
 }
 
 fn render_sessions(frame: &mut Frame, state: &AppState, layout: &MainLayout) {
@@ -258,20 +197,14 @@ fn render_status(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rec
     }
 
     let mode = match state.modal {
-        ModalState::None if state.main_tab == MainTab::Profiles => "Profiles",
         ModalState::None => match state.focus {
             FocusPane::Projects => "Projects",
             FocusPane::Sessions => "Sessions",
         },
         ModalState::Search => "Search",
         ModalState::Rename => "Rename",
-        ModalState::NewProfile => "New Profile",
         ModalState::DeleteConfirm => "Delete",
         ModalState::Info => "Info",
-        ModalState::EditProfile { .. } => "Editing",
-        ModalState::BindProfile { .. } => "Bind Profile",
-        ModalState::PickProfile { .. } => "Pick Profile",
-        ModalState::CopyProfile => "Copy Profile",
     };
 
     let status_message = state
@@ -303,65 +236,36 @@ fn shortcuts_for(state: &AppState) -> Vec<Span<'static>> {
         )];
     }
 
-    let pairs: &[(&str, &str)] = if state.main_tab == MainTab::Profiles
-        && state.modal == ModalState::None
-    {
-        &[
-            ("↑↓", "Move"),
-            ("Enter", "Activate"),
-            ("n", "New"),
-            ("c", "Copy"),
-            ("Ctrl+D", "Delete"),
-            ("q/Esc", "Quit"),
-        ]
-    } else {
-        match state.modal {
-            ModalState::None => match state.focus {
-                FocusPane::Projects => &[
-                    ("Tab/←→", "Focus"),
-                    ("↑↓", "Move"),
-                    ("Enter", "New Session"),
-                    ("p", "Pick Profile"),
-                    ("i", "Session Info"),
-                    ("r", "Rename Session"),
-                    ("e", "Bind Profile"),
-                    ("u", "Unbind"),
-                    ("Ctrl+D", "Delete Project"),
-                    ("/", "Search"),
-                    ("a", "Agent"),
-                    ("q/Esc", "Quit"),
-                ],
-                FocusPane::Sessions => &[
-                    ("Tab/←→", "Focus"),
-                    ("↑↓", "Move"),
-                    ("Enter", "Resume"),
-                    ("n", "New"),
-                    ("i", "Info"),
-                    ("r", "Rename"),
-                    ("Ctrl+D", "Delete Session"),
-                    ("/", "Search"),
-                    ("a", "Agent"),
-                    ("q/Esc", "Quit"),
-                ],
-            },
-            ModalState::Search => &[("Type", "Query"), ("Enter", "Apply"), ("q/Esc", "Cancel")],
-            ModalState::Rename => &[("Type", "Title"), ("Enter", "Save"), ("q/Esc", "Cancel")],
-            ModalState::DeleteConfirm => &[("Enter/y/Ctrl+D", "Confirm"), ("q/Esc/n", "Cancel")],
-            ModalState::NewProfile => &[
-                ("Type", "Name"),
-                ("Enter", "Open editor"),
-                ("q/Esc", "Cancel"),
+    let pairs: &[(&str, &str)] = match state.modal {
+        ModalState::None => match state.focus {
+            FocusPane::Projects => &[
+                ("Tab/←→", "Focus"),
+                ("↑↓", "Move"),
+                ("Enter", "New Session"),
+                ("i", "Session Info"),
+                ("r", "Rename Session"),
+                ("Ctrl+D", "Delete Project"),
+                ("/", "Search"),
+                ("a", "Agent"),
+                ("q/Esc", "Quit"),
             ],
-            ModalState::EditProfile { .. } => &[], // Editor owns the terminal
-            ModalState::BindProfile { .. } => {
-                &[("↑↓", "Select"), ("Enter", "Bind"), ("q/Esc", "Cancel")]
-            }
-            ModalState::PickProfile { .. } => {
-                &[("↑↓", "Select"), ("Enter", "Launch"), ("q/Esc", "Cancel")]
-            }
-            ModalState::CopyProfile => &[("Type", "Name"), ("Enter", "Copy"), ("q/Esc", "Cancel")],
-            ModalState::Info => &[("q/Esc/Enter", "Close")],
-        }
+            FocusPane::Sessions => &[
+                ("Tab/←→", "Focus"),
+                ("↑↓", "Move"),
+                ("Enter", "Resume"),
+                ("n", "New"),
+                ("i", "Info"),
+                ("r", "Rename"),
+                ("Ctrl+D", "Delete Session"),
+                ("/", "Search"),
+                ("a", "Agent"),
+                ("q/Esc", "Quit"),
+            ],
+        },
+        ModalState::Search => &[("Type", "Query"), ("Enter", "Apply"), ("q/Esc", "Cancel")],
+        ModalState::Rename => &[("Type", "Title"), ("Enter", "Save"), ("q/Esc", "Cancel")],
+        ModalState::DeleteConfirm => &[("Enter/y/Ctrl+D", "Confirm"), ("q/Esc/n", "Cancel")],
+        ModalState::Info => &[("q/Esc/Enter", "Close")],
     };
 
     let mut spans = Vec::new();
@@ -510,80 +414,6 @@ fn render_confirm_modal(frame: &mut Frame, state: &AppState) {
     frame.render_widget(Paragraph::new(text).block(block), area);
 }
 
-fn render_bind_profile_modal(frame: &mut Frame, state: &AppState, profile_cursor: usize) {
-    let area = centered_rect(40, 40, frame.area());
-    frame.render_widget(Clear, area);
-
-    // Get the profile bound to the currently selected project
-    let bound_profile = state
-        .project_bindings
-        .get(state.selected_project)
-        .and_then(|b| b.as_deref());
-
-    let items: Vec<ListItem> = state
-        .profiles
-        .iter()
-        .map(|profile| {
-            let marker = if bound_profile == Some(&profile.name) {
-                " ◉"
-            } else {
-                ""
-            };
-            ListItem::new(format!("{}{marker}", profile.name))
-        })
-        .collect();
-
-    let block = Block::default()
-        .title("Bind Profile to Project")
-        .borders(Borders::ALL)
-        .border_style(modal_border_style(&state.theme));
-
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(project_highlight_style(&state.theme))
-        .highlight_symbol("> ");
-
-    let mut list_state = ratatui::widgets::ListState::default();
-    if !state.profiles.is_empty() && profile_cursor < state.profiles.len() {
-        list_state.select(Some(profile_cursor));
-    }
-    frame.render_stateful_widget(list, area, &mut list_state);
-}
-
-fn render_pick_profile_modal(frame: &mut Frame, state: &AppState, profile_cursor: usize) {
-    let area = centered_rect(40, 40, frame.area());
-    frame.render_widget(Clear, area);
-
-    let items: Vec<ListItem> = state
-        .profiles
-        .iter()
-        .map(|profile| {
-            let active = if state.active_profile_name.as_deref() == Some(&profile.name) {
-                " *"
-            } else {
-                ""
-            };
-            ListItem::new(format!("{}{active}", profile.name))
-        })
-        .collect();
-
-    let block = Block::default()
-        .title("Pick Profile to Launch With")
-        .borders(Borders::ALL)
-        .border_style(modal_border_style(&state.theme));
-
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(project_highlight_style(&state.theme))
-        .highlight_symbol("> ");
-
-    let mut list_state = ratatui::widgets::ListState::default();
-    if !state.profiles.is_empty() && profile_cursor < state.profiles.len() {
-        list_state.select(Some(profile_cursor));
-    }
-    frame.render_stateful_widget(list, area, &mut list_state);
-}
-
 /// Format an RFC 3339 timestamp to "yyyy-MM-dd HH:mm:ss" in the system-local
 /// time zone.
 fn format_ts_short(ts: &str) -> Option<String> {
@@ -653,22 +483,6 @@ mod tests {
             .collect::<String>();
 
         assert!(text.contains("q/Esc Quit"));
-    }
-
-    #[test]
-    fn profile_shortcuts_advertise_enter_without_space() {
-        let state = AppState {
-            main_tab: MainTab::Profiles,
-            ..AppState::default()
-        };
-
-        let text = shortcuts_for(&state)
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-
-        assert!(text.contains("Enter Activate"));
-        assert!(!text.contains("Space"));
     }
 
     #[test]

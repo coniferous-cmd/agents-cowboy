@@ -67,7 +67,6 @@ pub struct BackendCapabilities {
     pub rename_session: bool,
     pub delete_session: bool,
     pub delete_project: bool,
-    pub profiles: bool,
     pub usage: bool,
 }
 
@@ -143,12 +142,6 @@ impl Project {
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| self.cwd.display().to_string())
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectProfileBinding {
-    pub project_cwd: PathBuf,
-    pub profile_name: String,
 }
 
 impl Project {
@@ -231,19 +224,13 @@ pub enum StetsonError {
     Sqlite(rusqlite::Error),
     InvalidSessionFile(String),
     InvalidSettingsFile(String),
-    InvalidProfileName(String),
-    ProfileExists(String),
-    ProfileNotFound(String),
     MigrationFailed(String),
-    ActivationRecoveryFailed(String),
     UnsupportedSchemaVersion(i64),
     SessionNotFound(String),
     ProjectNotFound(String),
     ProjectSettingsNotFound(String),
     ThemeNotFound(String),
     HomeDirectoryUnavailable,
-    BindingNotFound(String),
-    ProfileInUse(String),
 }
 
 impl fmt::Display for StetsonError {
@@ -254,13 +241,7 @@ impl fmt::Display for StetsonError {
             Self::Sqlite(error) => write!(f, "sqlite error: {error}"),
             Self::InvalidSessionFile(message) => write!(f, "invalid session file: {message}"),
             Self::InvalidSettingsFile(message) => write!(f, "invalid settings file: {message}"),
-            Self::InvalidProfileName(message) => write!(f, "invalid profile name: {message}"),
-            Self::ProfileExists(name) => write!(f, "profile already exists: {name}"),
-            Self::ProfileNotFound(name) => write!(f, "profile not found: {name}"),
             Self::MigrationFailed(message) => write!(f, "metadata migration failed: {message}"),
-            Self::ActivationRecoveryFailed(message) => {
-                write!(f, "profile activation recovery failed: {message}")
-            }
             Self::UnsupportedSchemaVersion(version) => {
                 write!(f, "unsupported metadata schema version: {version}")
             }
@@ -271,10 +252,6 @@ impl fmt::Display for StetsonError {
             }
             Self::ThemeNotFound(name) => write!(f, "theme not found: {name}"),
             Self::HomeDirectoryUnavailable => write!(f, "home directory is unavailable"),
-            Self::BindingNotFound(path) => write!(f, "no profile bound to project: {path}"),
-            Self::ProfileInUse(name) => {
-                write!(f, "profile is bound to one or more projects: {name}")
-            }
         }
     }
 }
@@ -287,19 +264,13 @@ impl StdError for StetsonError {
             Self::Sqlite(error) => Some(error),
             Self::InvalidSessionFile(_) => None,
             Self::InvalidSettingsFile(_) => None,
-            Self::InvalidProfileName(_) => None,
-            Self::ProfileExists(_) => None,
-            Self::ProfileNotFound(_) => None,
             Self::MigrationFailed(_) => None,
-            Self::ActivationRecoveryFailed(_) => None,
             Self::UnsupportedSchemaVersion(_) => None,
             Self::SessionNotFound(_) => None,
             Self::ProjectNotFound(_) => None,
             Self::ProjectSettingsNotFound(_) => None,
             Self::ThemeNotFound(_) => None,
             Self::HomeDirectoryUnavailable => None,
-            Self::BindingNotFound(_) => None,
-            Self::ProfileInUse(_) => None,
         }
     }
 }

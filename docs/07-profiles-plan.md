@@ -1,5 +1,7 @@
 # Profiles 配置片段计划
 
+> 历史文档：Cowboy 已移除 Profiles。以下保留旧版实现记录，当前行为见 [升级说明](../README.md#upgrading-from-a-release-with-profiles)。
+
 ## 实施状态
 
 状态：已实现（2026-08-08）。本文档是 Profiles 实现与验收的事实来源；实现过程中若发现现有架构约束与计划冲突，先修订本文档，再修改代码。

@@ -4,7 +4,6 @@ mod session_actions;
 // ── Internal modules ─────────────────────────────────────────────────────────
 
 mod state {
-    use cowboy::claude_env::ClaudeProfile;
     use cowboy::domain::{AgentId, SessionKey};
     use cowboy::theme::ThemePalette;
     use std::path::PathBuf;
@@ -18,13 +17,7 @@ mod state {
         Sessions,
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum MainTab {
-        Projects,
-        Profiles,
-    }
-
-    /// Limits the sessions shown in the Projects tab to one Agent backend.
+    /// Limits the sessions shown in the session pane to one agent backend.
     #[derive(Debug, Clone, PartialEq, Eq, Default)]
     pub enum AgentFilter {
         #[default]
@@ -71,13 +64,8 @@ mod state {
         None,
         Search,
         Rename,
-        NewProfile,
         DeleteConfirm,
         Info,
-        EditProfile { profile_id: i64 },
-        BindProfile { profile_cursor: usize },
-        PickProfile { profile_cursor: usize },
-        CopyProfile,
     }
 
     /// Result of a worker-thread deletion, paired with its originating target.
@@ -118,10 +106,6 @@ mod state {
             title: String,
             key: SessionKey,
         },
-        Profile {
-            agent_id: AgentId,
-            name: String,
-        },
     }
 
     impl DeleteTarget {
@@ -130,7 +114,6 @@ mod state {
             match self {
                 Self::Project { .. } => Kind::Project,
                 Self::Session { .. } => Kind::Session,
-                Self::Profile { .. } => Kind::Profile,
             }
         }
 
@@ -138,7 +121,6 @@ mod state {
             match self {
                 Self::Project { name, .. } => name,
                 Self::Session { title, .. } => title,
-                Self::Profile { name, .. } => name,
             }
         }
 
@@ -173,7 +155,6 @@ mod state {
     pub(crate) enum Kind {
         Project,
         Session,
-        Profile,
     }
 
     impl Kind {
@@ -181,7 +162,6 @@ mod state {
             match self {
                 Self::Project => "Project",
                 Self::Session => "Session",
-                Self::Profile => "Profile",
             }
         }
     }
@@ -243,12 +223,7 @@ mod state {
 
     pub struct AppState {
         pub projects: Vec<cowboy::domain::Project>,
-        pub profiles: Vec<ClaudeProfile>,
-        pub active_profile_name: Option<String>,
-        pub project_bindings: Vec<Option<String>>,
-        pub main_tab: MainTab,
         pub agent_filter: AgentFilter,
-        pub profile_cursor: usize,
         pub selected_project: usize,
         pub selected_session: usize,
         pub focus: FocusPane,
@@ -260,14 +235,6 @@ mod state {
         pub should_quit: bool,
         pub pending_resume: Option<ResumeTarget>,
         pub pending_new_session: Option<PathBuf>,
-        pub pending_profile_edit: Option<String>,
-        /// One-shot profile override for launching a session with a specific
-        /// profile without permanently binding it to the project.
-        pub pending_profile_override: Option<PathBuf>,
-        /// Set after an external editor temporarily owns the terminal. The
-        /// ratatui `Terminal` must then clear its cached previous frame before
-        /// drawing again, or unchanged cells are not repainted.
-        pub terminal_refresh_pending: bool,
         pub info: Option<SessionInfo>,
         pub delete_target: Option<DeleteTarget>,
         pub pending_delete: Option<DeleteTarget>,
@@ -279,12 +246,7 @@ mod state {
         fn default() -> Self {
             Self {
                 projects: Vec::new(),
-                profiles: Vec::new(),
-                active_profile_name: None,
-                project_bindings: Vec::new(),
-                main_tab: MainTab::Projects,
                 agent_filter: AgentFilter::All,
-                profile_cursor: 0,
                 selected_project: 0,
                 selected_session: 0,
                 focus: FocusPane::Projects,
@@ -295,9 +257,6 @@ mod state {
                 should_quit: false,
                 pending_resume: None,
                 pending_new_session: None,
-                pending_profile_edit: None,
-                pending_profile_override: None,
-                terminal_refresh_pending: false,
                 info: None,
                 delete_target: None,
                 pending_delete: None,
@@ -430,21 +389,17 @@ mod state {
 
 mod navigation {
     use crate::application::{
-        project_name_owned, project_working_dir, session_key, session_title, ProfileRepository,
-        ResumeLauncher, SessionRepository,
+        project_name_owned, project_working_dir, session_key, session_title, ResumeLauncher,
+        SessionRepository,
     };
 
-    use super::state::{
-        agent_filters, AgentFilter, DeleteTarget, FocusPane, OPEN_HERE_PROJECT_LABEL,
-    };
+    use super::state::{agent_filters, AgentFilter, FocusPane, OPEN_HERE_PROJECT_LABEL};
     use super::Stetson;
-    use super::{MainTab, ModalState};
 
-    impl<R, L, P> Stetson<R, L, P>
+    impl<R, L> Stetson<R, L>
     where
         R: SessionRepository,
         L: ResumeLauncher,
-        P: ProfileRepository,
     {
         pub fn toggle_focus(&mut self) {
             self.state.focus = match self.state.focus {
@@ -470,192 +425,6 @@ mod navigation {
             self.state.selected_session = 0;
             self.clamp_selections();
             self.state.status = format!("Agent: {}", self.state.agent_filter.label());
-        }
-
-        pub fn switch_tab(&mut self, delta: isize) {
-            let index = match self.state.main_tab {
-                MainTab::Projects => 0isize,
-                MainTab::Profiles => 1,
-            };
-            self.state.main_tab = match (index + delta).rem_euclid(2) {
-                0 => MainTab::Projects,
-                _ => MainTab::Profiles,
-            };
-            match self.state.main_tab {
-                MainTab::Projects => self.state.focus = FocusPane::Projects,
-                MainTab::Profiles => {}
-            }
-            self.state.status = format!("Tab: {:?}", self.state.main_tab);
-        }
-
-        pub fn move_profile_cursor(&mut self, delta: isize) {
-            let len = self.state.profiles.len();
-            self.state.profile_cursor = offset_index(self.state.profile_cursor, delta, len);
-        }
-
-        pub fn activate_profile_row(&mut self) {
-            let Some(name) = self
-                .state
-                .profiles
-                .get(self.state.profile_cursor)
-                .map(|profile| profile.name.clone())
-            else {
-                return;
-            };
-            match self.application.activate_profile(&name) {
-                Ok(()) => self.reload_profiles(format!("Activated profile: {name}")),
-                Err(error) => self.show_toast(error),
-            }
-        }
-
-        /// Enter the new-profile name modal. The name is captured here so it
-        /// stays out of the raw settings JSON edited in `$EDITOR`.
-        pub fn begin_new_profile(&mut self) {
-            self.state.modal = ModalState::NewProfile;
-            self.state.input_buffer.clear();
-            self.state.status = "New profile: enter name".to_string();
-        }
-
-        pub fn begin_profile_copy(&mut self) {
-            let Some(source) = self.state.profiles.get(self.state.profile_cursor) else {
-                return;
-            };
-            self.state.modal = ModalState::CopyProfile;
-            self.state.input_buffer = format!("Copy of {}", source.name);
-            self.state.status = format!("Copy profile: {}", source.name);
-        }
-
-        pub fn begin_profile_delete(&mut self) {
-            let Some(profile) = self.state.profiles.get(self.state.profile_cursor) else {
-                self.show_toast("No profile selected");
-                return;
-            };
-
-            let target = DeleteTarget::Profile {
-                agent_id: cowboy::domain::AgentId::new("claude")
-                    .expect("built-in agent id is valid"),
-                name: profile.name.clone(),
-            };
-            self.state.delete_target = Some(target.clone());
-            self.state.modal = ModalState::DeleteConfirm;
-            self.state.status = target.prompt_status();
-        }
-
-        pub fn begin_profile_edit(&mut self) {
-            let Some(profile) = self.state.profiles.get(self.state.profile_cursor) else {
-                self.show_toast("No profile selected");
-                return;
-            };
-
-            let profile_id = profile.id;
-            let profile_name = profile.name.clone();
-            let settings_json = profile.settings_json.clone();
-
-            // Set modal state
-            self.state.modal = ModalState::EditProfile { profile_id };
-            self.state.status = format!("Editing profile: {profile_name}");
-
-            // Hand the terminal over to the editor with full state
-            // management — the helper snapshots line discipline, runs
-            // vim, then resets vim's residual escape-sequence state
-            // before re-entering the TUI. Without the reset, vim's
-            // leftover character-set switches, SGR attributes, and
-            // mouse-tracking modes make the next ratatui draw render
-            // garbled / flickering frames.
-            let outcome = cowboy::features::profile_editor::edit_profile_json_with_terminal_reset(
-                &settings_json,
-            );
-            self.state.terminal_refresh_pending = true;
-
-            // Process outcome
-            match outcome {
-                Ok(cowboy::features::profile_editor::EditOutcome::Saved(new_json)) => {
-                    // Update profile and activate it
-                    if let Err(error) = self
-                        .application
-                        .update_profile_json(&profile_name, &new_json)
-                    {
-                        self.show_toast(format!("Failed to update profile: {error}"));
-                    } else if let Err(error) = self.application.activate_profile(&profile_name) {
-                        self.show_toast(format!("Failed to activate profile: {error}"));
-                    } else {
-                        self.reload_profiles(format!("Profile '{profile_name}' updated"));
-                    }
-                }
-                Ok(cowboy::features::profile_editor::EditOutcome::NoEditorConfigured) => {
-                    self.show_toast("EDITOR environment variable not set".to_string());
-                }
-                Ok(cowboy::features::profile_editor::EditOutcome::EditorExitedWithError(msg)) => {
-                    self.show_toast(msg);
-                }
-                Ok(cowboy::features::profile_editor::EditOutcome::ValidationError {
-                    error,
-                    ..
-                }) => {
-                    self.show_toast(format!("Invalid JSON: {error}"));
-                }
-                Err(error) => {
-                    self.show_toast(format!("Editor error: {error}"));
-                }
-            }
-
-            self.state.modal = ModalState::None;
-        }
-
-        pub fn begin_bind_profile(&mut self) {
-            if self.is_open_here_selected() {
-                self.show_toast("Cannot bind a profile to 'Open Here'");
-                return;
-            }
-            if self.state.selected_project >= self.state.projects.len() {
-                self.show_toast("No project selected");
-                return;
-            }
-            self.state.modal = ModalState::BindProfile { profile_cursor: 0 };
-            self.state.status = "Select profile to bind".to_string();
-        }
-
-        pub fn begin_pick_profile(&mut self) {
-            if self.state.profiles.is_empty() {
-                self.show_toast("No profiles available");
-                return;
-            }
-            self.state.modal = ModalState::PickProfile { profile_cursor: 0 };
-            self.state.status = "Select profile to launch with".to_string();
-        }
-
-        pub fn unbind_current_project(&mut self) {
-            if self.is_open_here_selected() {
-                self.show_toast("Cannot unbind 'Open Here'");
-                return;
-            }
-            if self.state.selected_project >= self.state.projects.len() {
-                self.show_toast("No project selected");
-                return;
-            }
-            let cwd = self.current_project().unwrap().cwd.clone();
-            match self.application.unbind_profile(&cwd) {
-                Ok(()) => {
-                    self.refresh_project_bindings();
-                    self.state.status = "Profile unbound".to_string();
-                }
-                Err(error) => self.show_toast(error),
-            }
-        }
-
-        pub fn refresh_project_bindings(&mut self) {
-            self.state.project_bindings = self
-                .state
-                .projects
-                .iter()
-                .map(|project| {
-                    self.application
-                        .project_binding(&project.cwd)
-                        .ok()
-                        .flatten()
-                        .map(|binding| binding.profile_name)
-                })
-                .collect();
         }
 
         pub fn move_selection(&mut self, delta: isize) {
@@ -740,7 +509,6 @@ mod navigation {
                 })
                 .unwrap_or(0);
             self.clamp_selections();
-            self.refresh_project_bindings();
             self.state.status = if self.state.projects.is_empty() {
                 "No projects found under ~/.claude".to_string()
             } else {
@@ -772,15 +540,14 @@ mod navigation {
 // ── Internal module: modal ───────────────────────────────────────────────────
 
 mod modal {
-    use crate::application::{session_key, ProfileRepository, ResumeLauncher, SessionRepository};
-    use cowboy::claude_env::validate_profile_name;
+    use crate::application::{session_key, ResumeLauncher, SessionRepository};
     use cowboy::domain::validate_rename_title;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use super::state::{DeleteTarget, ModalState};
+    use super::state::ModalState;
     use super::Stetson;
 
-    impl<R: SessionRepository, L: ResumeLauncher, P: ProfileRepository> Stetson<R, L, P> {
+    impl<R: SessionRepository, L: ResumeLauncher> Stetson<R, L> {
         pub fn handle_key(&mut self, key: KeyEvent) {
             if self.delete_in_progress() {
                 let is_quit = matches!(key.code, KeyCode::Char('q'))
@@ -797,48 +564,18 @@ mod modal {
             match self.state.modal {
                 ModalState::Search => self.handle_search_key(key),
                 ModalState::Rename => self.handle_rename_key(key),
-                ModalState::NewProfile => self.handle_new_profile_key(key),
                 ModalState::DeleteConfirm => self.handle_delete_key(key),
                 ModalState::Info => self.handle_info_key(key),
-                ModalState::EditProfile { .. } => {} // Editor owns the terminal
-                ModalState::BindProfile { .. } => self.handle_bind_profile_key(key),
-                ModalState::PickProfile { .. } => self.handle_pick_profile_key(key),
-                ModalState::CopyProfile => self.handle_copy_key(key),
                 ModalState::None => self.handle_normal_key(key),
             }
         }
 
         fn handle_normal_key(&mut self, key: KeyEvent) {
-            if matches!(key.code, KeyCode::Char('[')) {
-                self.switch_tab(-1);
-                return;
-            }
-            if matches!(key.code, KeyCode::Char(']')) {
-                self.switch_tab(1);
-                return;
-            }
-            if self.state.main_tab == super::MainTab::Profiles {
-                match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') => self.state.should_quit = true,
-                    KeyCode::Down => self.move_profile_cursor(1),
-                    KeyCode::Up => self.move_profile_cursor(-1),
-                    KeyCode::Enter => self.activate_profile_row(),
-                    KeyCode::Char('n') => self.begin_new_profile(),
-                    KeyCode::Char('e') => self.begin_profile_edit(),
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.state.should_quit = true;
-                    }
-                    KeyCode::Char('c') => self.begin_profile_copy(),
-                    KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.begin_profile_delete()
-                    }
-                    _ => {}
-                }
-                return;
-            }
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => self.state.should_quit = true,
-                KeyCode::Tab | KeyCode::Right | KeyCode::Left => self.toggle_focus(),
+                KeyCode::Tab | KeyCode::Right | KeyCode::Left | KeyCode::Char('[' | ']') => {
+                    self.toggle_focus()
+                }
                 KeyCode::Down => self.move_selection(1),
                 KeyCode::Up => self.move_selection(-1),
                 KeyCode::Char('a') => self.cycle_agent_filter(),
@@ -848,22 +585,10 @@ mod modal {
                 KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.begin_delete()
                 }
-                KeyCode::Char('e') if self.state.focus == super::state::FocusPane::Projects => {
-                    self.begin_bind_profile()
-                }
-                KeyCode::Char('u') if self.state.focus == super::state::FocusPane::Projects => {
-                    self.unbind_current_project()
-                }
                 KeyCode::Char('n') if self.state.focus == super::state::FocusPane::Sessions => {
                     self.new_session()
                 }
                 KeyCode::Enter => self.activate_selection(),
-                KeyCode::Char('p')
-                    if self.state.focus == super::state::FocusPane::Projects
-                        && !self.is_open_here_selected() =>
-                {
-                    self.begin_pick_profile()
-                }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.state.should_quit = true;
                 }
@@ -933,96 +658,6 @@ mod modal {
             }
         }
 
-        fn handle_new_profile_key(&mut self, key: KeyEvent) {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    self.state.modal = ModalState::None;
-                    self.state.input_buffer.clear();
-                    self.state.status = "New profile canceled".to_string();
-                }
-                KeyCode::Enter => {
-                    let normalized = match validate_profile_name(&self.state.input_buffer) {
-                        Ok(name) => name,
-                        Err(error) => {
-                            self.show_toast(error.to_string());
-                            return;
-                        }
-                    };
-                    if self
-                        .state
-                        .profiles
-                        .iter()
-                        .any(|profile| profile.name == normalized)
-                    {
-                        self.show_toast(format!("Profile already exists: {normalized}"));
-                        return;
-                    }
-                    self.state.pending_profile_edit = Some(normalized);
-                    self.state.input_buffer.clear();
-                    self.state.modal = ModalState::None;
-                    self.state.status = "Opening editor…".to_string();
-                    self.state.should_quit = true;
-                }
-                KeyCode::Backspace => {
-                    self.state.input_buffer.pop();
-                }
-                KeyCode::Char(ch) => self.state.input_buffer.push(ch),
-                _ => {}
-            }
-        }
-
-        fn handle_copy_key(&mut self, key: KeyEvent) {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    self.state.modal = ModalState::None;
-                    self.state.input_buffer.clear();
-                    self.state.status = "Copy canceled".to_string();
-                }
-                KeyCode::Enter => {
-                    let normalized = match validate_profile_name(&self.state.input_buffer) {
-                        Ok(name) => name,
-                        Err(error) => {
-                            self.show_toast(error.to_string());
-                            return;
-                        }
-                    };
-                    if self
-                        .state
-                        .profiles
-                        .iter()
-                        .any(|profile| profile.name == normalized)
-                    {
-                        self.show_toast(format!("Profile already exists: {normalized}"));
-                        return;
-                    }
-                    // Find source profile name from cursor
-                    let Some(source) = self.state.profiles.get(self.state.profile_cursor) else {
-                        self.show_toast("No profile selected");
-                        self.state.modal = ModalState::None;
-                        return;
-                    };
-                    match self.application.copy_profile(&source.name, &normalized) {
-                        Ok(copied) => {
-                            self.reload_profiles(format!(
-                                "Copied '{}' to '{}'",
-                                source.name, copied.name
-                            ));
-                        }
-                        Err(error) => {
-                            self.show_toast(error);
-                        }
-                    }
-                    self.state.modal = ModalState::None;
-                    self.state.input_buffer.clear();
-                }
-                KeyCode::Backspace => {
-                    self.state.input_buffer.pop();
-                }
-                KeyCode::Char(ch) => self.state.input_buffer.push(ch),
-                _ => {}
-            }
-        }
-
         fn handle_delete_key(&mut self, key: KeyEvent) {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
@@ -1051,13 +686,6 @@ mod modal {
             };
 
             self.state.modal = ModalState::None;
-            if let DeleteTarget::Profile { name, .. } = &target {
-                match self.application.delete_profile(name) {
-                    Ok(()) => self.reload_profiles(target.success_status()),
-                    Err(error) => self.show_toast(error),
-                }
-                return;
-            }
             self.state.status = format!("Deleting {}...", target.name());
             self.state.pending_delete = Some(target.clone());
             self.state.delete_in_progress = Some(target);
@@ -1067,115 +695,6 @@ mod modal {
             if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
                 self.state.modal = ModalState::None;
                 self.state.status = "Closed session info".to_string();
-            }
-        }
-
-        fn handle_bind_profile_key(&mut self, key: KeyEvent) {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    self.state.modal = ModalState::None;
-                    self.state.status = "Bind profile canceled".to_string();
-                }
-                KeyCode::Down => {
-                    if let ModalState::BindProfile { profile_cursor } = &mut self.state.modal {
-                        let len = self.state.profiles.len();
-                        if len > 0 {
-                            *profile_cursor = (*profile_cursor + 1).min(len - 1);
-                        }
-                    }
-                }
-                KeyCode::Up => {
-                    if let ModalState::BindProfile { profile_cursor } = &mut self.state.modal {
-                        *profile_cursor = profile_cursor.saturating_sub(1);
-                    }
-                }
-                KeyCode::Enter => {
-                    let profile_cursor = match &self.state.modal {
-                        ModalState::BindProfile { profile_cursor } => *profile_cursor,
-                        _ => return,
-                    };
-
-                    if profile_cursor >= self.state.profiles.len() {
-                        self.show_toast("No profile selected");
-                        return;
-                    }
-
-                    let profile_name = self.state.profiles[profile_cursor].name.clone();
-                    let cwd = match self.current_project() {
-                        Some(project) => project.cwd.clone(),
-                        None => {
-                            self.show_toast("No project selected");
-                            self.state.modal = ModalState::None;
-                            return;
-                        }
-                    };
-
-                    match self.application.bind_profile(&cwd, &profile_name) {
-                        Ok(()) => {
-                            self.refresh_project_bindings();
-                            self.state.modal = ModalState::None;
-                            self.state.status =
-                                format!("Bound profile '{}' to project", profile_name);
-                        }
-                        Err(error) => self.show_toast(error),
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        fn handle_pick_profile_key(&mut self, key: KeyEvent) {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    self.state.modal = ModalState::None;
-                    self.state.status = "Profile pick canceled".to_string();
-                }
-                KeyCode::Down => {
-                    if let ModalState::PickProfile { profile_cursor } = &mut self.state.modal {
-                        let len = self.state.profiles.len();
-                        if len > 0 {
-                            *profile_cursor = (*profile_cursor + 1).min(len - 1);
-                        }
-                    }
-                }
-                KeyCode::Up => {
-                    if let ModalState::PickProfile { profile_cursor } = &mut self.state.modal {
-                        *profile_cursor = profile_cursor.saturating_sub(1);
-                    }
-                }
-                KeyCode::Enter => {
-                    let profile_cursor = match &self.state.modal {
-                        ModalState::PickProfile { profile_cursor } => *profile_cursor,
-                        _ => return,
-                    };
-
-                    if profile_cursor >= self.state.profiles.len() {
-                        self.show_toast("No profile selected");
-                        return;
-                    }
-
-                    let profile_name = self.state.profiles[profile_cursor].name.clone();
-                    let cwd = match self.current_project() {
-                        Some(project) => project.cwd.clone(),
-                        None => {
-                            self.show_toast("No project selected");
-                            self.state.modal = ModalState::None;
-                            return;
-                        }
-                    };
-
-                    // Resolve the profile's settings file path for the one-shot launch
-                    match self.application.profile_file_path(&profile_name) {
-                        Ok(profile_path) => {
-                            self.state.pending_profile_override = Some(profile_path);
-                            self.state.pending_new_session = Some(cwd);
-                            self.state.modal = ModalState::None;
-                            self.state.should_quit = true;
-                        }
-                        Err(error) => self.show_toast(error),
-                    }
-                }
-                _ => {}
             }
         }
     }
@@ -1221,39 +740,31 @@ mod modal {
 // ── Public re-exports ────────────────────────────────────────────────────────
 
 pub use state::{
-    agent_filters, AppState, DeleteCompletion, DeleteOutcome, DeleteTarget, FocusPane, MainTab,
-    ModalState, ResumeTarget, Toast,
+    agent_filters, AppState, DeleteCompletion, DeleteOutcome, DeleteTarget, FocusPane, ModalState,
+    ResumeTarget, Toast,
 };
 
 // ── Stetson main impl ────────────────────────────────────────────────────────
 
-use crate::application::{
-    AppResult, NoProfileRepository, ProfileRepository, ResumeLauncher, SessionRepository,
-    StetsonApplication,
-};
-use cowboy::features::profile_editor::EditOutcome;
+use crate::application::{AppResult, ResumeLauncher, SessionRepository, StetsonApplication};
 use std::path::PathBuf;
-
-pub type LoadedProfiles = (Vec<cowboy::claude_env::ClaudeProfile>, Option<String>);
 
 #[derive(Debug)]
 pub struct InitialLoadCompletion {
     pub projects: AppResult<Vec<cowboy::domain::Project>>,
-    pub profiles: AppResult<LoadedProfiles>,
 }
 
-pub struct Stetson<R, L, P = NoProfileRepository> {
-    application: StetsonApplication<R, L, P>,
+pub struct Stetson<R, L> {
+    application: StetsonApplication<R, L>,
     state: AppState,
 }
 
-impl<R, L, P> Stetson<R, L, P>
+impl<R, L> Stetson<R, L>
 where
     R: SessionRepository,
     L: ResumeLauncher,
-    P: ProfileRepository,
 {
-    pub fn new(application: StetsonApplication<R, L, P>) -> Self {
+    pub fn new(application: StetsonApplication<R, L>) -> Self {
         Self {
             application,
             state: AppState::default(),
@@ -1295,24 +806,6 @@ where
         self.state.pending_new_session.take()
     }
 
-    /// Take the one-shot profile override for a pending new session.
-    /// Returns `Some` at most once per queued launch.
-    pub fn take_pending_profile_override(&mut self) -> Option<PathBuf> {
-        self.state.pending_profile_override.take()
-    }
-
-    /// Take the name of a profile whose `$EDITOR` session is waiting to run.
-    /// Returns `Some` at most once per queued creation.
-    pub fn take_pending_profile_edit(&mut self) -> Option<String> {
-        self.state.pending_profile_edit.take()
-    }
-
-    /// Consume the request to invalidate ratatui's cached previous frame after
-    /// an external editor has modified the terminal contents.
-    pub fn take_terminal_refresh_request(&mut self) -> bool {
-        std::mem::take(&mut self.state.terminal_refresh_pending)
-    }
-
     /// Take the confirmed-but-unstarted delete task for the main loop to run on
     /// a worker thread. Returns `Some` at most once per queued task.
     pub fn take_pending_delete(&mut self) -> Option<DeleteTarget> {
@@ -1344,78 +837,9 @@ where
     }
 
     pub fn complete_initial_load(&mut self, completion: InitialLoadCompletion) {
-        let projects_loaded = match completion.projects {
-            Ok(projects) => {
-                self.replace_projects(projects, "Loaded ~/.claude");
-                true
-            }
-            Err(error) => {
-                self.show_toast(error);
-                false
-            }
-        };
-
-        let profiles_loaded = match completion.profiles {
-            Ok((profiles, active_profile_name)) => {
-                self.state.profiles = profiles;
-                self.state.active_profile_name = active_profile_name;
-                true
-            }
-            Err(error) => {
-                self.show_toast(error);
-                false
-            }
-        };
-
-        if projects_loaded && profiles_loaded && !self.state.projects.is_empty() {
-            self.state.status = "Loaded ~/.claude".to_string();
-        }
-    }
-
-    /// Run the `$EDITOR` session for a new profile, then persist the result into
-    /// SQLite. Must be called *after* the TUI has left raw mode (mirrors how
-    /// main.rs runs the blocking launch between `leave_tui` / `enter_tui`).
-    pub(crate) fn run_new_profile_editor(&mut self, name: &str) -> AppResult<String> {
-        // main.rs has already left raw mode and the alternate screen for this
-        // flow, so the low-level helper must not perform a second terminal
-        // leave/re-enter cycle.
-        match cowboy::features::profile_editor::edit_profile_json("{}")? {
-            EditOutcome::Saved(json) => {
-                self.application.create_profile(name)?;
-                if let Err(error) = self.application.update_profile_json(name, &json) {
-                    let rollback = self.application.delete_profile(name);
-                    return Err(match rollback {
-                        Ok(()) => error,
-                        Err(rollback_error) => format!(
-                            "Failed to save profile '{name}': {error}; rollback also failed: {rollback_error}"
-                        ),
-                    });
-                }
-                Ok(format!("Created profile: {name}"))
-            }
-            EditOutcome::NoEditorConfigured => {
-                Err("$EDITOR is not set or empty; profile not created".into())
-            }
-            EditOutcome::EditorExitedWithError(message) => Err(message),
-            EditOutcome::ValidationError { error, .. } => {
-                Err(format!("Invalid profile JSON: {error}"))
-            }
-        }
-    }
-
-    /// Apply the outcome of a new-profile editor session: refresh the profile
-    /// list and surface either a status line (success) or a toast (failure).
-    pub fn profile_edit_finished(&mut self, outcome: AppResult<String>) {
-        self.state.should_quit = false;
-        self.state.pending_profile_edit = None;
-        self.state.modal = ModalState::None;
-        self.state.input_buffer.clear();
-        self.reload_profiles(match &outcome {
-            Ok(success) => success.clone(),
-            Err(_) => "Profile edit failed".to_string(),
-        });
-        if let Err(error) = outcome {
-            self.show_toast(error);
+        match completion.projects {
+            Ok(projects) => self.replace_projects(projects, "Loaded ~/.claude"),
+            Err(error) => self.show_toast(error),
         }
     }
 
@@ -1423,8 +847,6 @@ where
         self.state.should_quit = false;
         self.state.pending_resume = None;
         self.state.pending_new_session = None;
-        self.state.pending_profile_edit = None;
-        self.state.pending_profile_override = None;
         self.state.modal = ModalState::None;
         self.state.info = None;
         self.state.input_buffer.clear();
@@ -1435,30 +857,15 @@ where
             Err(error) => self.show_toast(error),
         }
     }
-
-    fn reload_profiles(&mut self, status: impl Into<String>) {
-        match self.application.load_profile_data() {
-            Ok((profiles, active_profile_name)) => {
-                self.state.profiles = profiles;
-                self.state.active_profile_name = active_profile_name;
-                let len = self.state.profiles.len();
-                self.state.profile_cursor = self.state.profile_cursor.min(len.saturating_sub(1));
-                self.state.status = status.into();
-            }
-            Err(error) => self.show_toast(error),
-        }
-    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
-    use super::state::{AgentFilter, DeleteTarget, FocusPane, MainTab, ModalState, ResumeTarget};
+    use super::state::{AgentFilter, DeleteTarget, FocusPane, ModalState, ResumeTarget};
     use super::{DeleteCompletion, DeleteOutcome, InitialLoadCompletion, Stetson};
-    use crate::application::{
-        AppResult, ProfileRepository, ResumeLauncher, SessionRepository, StetsonApplication,
-    };
+    use crate::application::{AppResult, ResumeLauncher, SessionRepository, StetsonApplication};
     use cowboy::domain::{Project, Session, SessionCapabilities, SessionKey};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::cell::RefCell;
@@ -1534,126 +941,6 @@ mod tests {
         fn launch_new(&self, _cwd: &Path) -> AppResult<()> {
             Ok(())
         }
-        fn launch_new_with_override(&self, _cwd: &Path, _profile_path: &Path) -> AppResult<()> {
-            Ok(())
-        }
-    }
-
-    #[derive(Clone)]
-    struct SpyProfileRepository {
-        profiles: Vec<cowboy::claude_env::ClaudeProfile>,
-        activated_profiles: Rc<RefCell<Vec<String>>>,
-        bind_calls: Rc<RefCell<Vec<(PathBuf, String)>>>,
-        unbind_calls: Rc<RefCell<Vec<PathBuf>>>,
-        profile_file_path: PathBuf,
-    }
-
-    impl ProfileRepository for SpyProfileRepository {
-        fn list_profiles(&self) -> AppResult<Vec<cowboy::claude_env::ClaudeProfile>> {
-            Ok(self.profiles.clone())
-        }
-
-        fn active_profile_name(&self) -> AppResult<Option<String>> {
-            Ok(None)
-        }
-
-        fn activate_profile(&self, name: &str) -> AppResult<()> {
-            self.activated_profiles.borrow_mut().push(name.to_string());
-            Ok(())
-        }
-
-        fn create_profile(&self, _name: &str) -> AppResult<cowboy::claude_env::ClaudeProfile> {
-            Err("not used in this test".to_string())
-        }
-
-        fn update_profile_json(
-            &self,
-            _name: &str,
-            _settings_json: &str,
-        ) -> AppResult<cowboy::claude_env::ClaudeProfile> {
-            Err("not used in this test".to_string())
-        }
-
-        fn delete_profile(&self, _name: &str) -> AppResult<()> {
-            Err("not used in this test".to_string())
-        }
-
-        fn bind_profile(&self, project_cwd: &std::path::Path, profile_name: &str) -> AppResult<()> {
-            self.bind_calls
-                .borrow_mut()
-                .push((project_cwd.to_path_buf(), profile_name.to_string()));
-            Ok(())
-        }
-
-        fn unbind_profile(&self, project_cwd: &std::path::Path) -> AppResult<()> {
-            self.unbind_calls
-                .borrow_mut()
-                .push(project_cwd.to_path_buf());
-            Ok(())
-        }
-
-        fn project_binding(
-            &self,
-            _project_cwd: &std::path::Path,
-        ) -> AppResult<Option<cowboy::domain::ProjectProfileBinding>> {
-            Ok(None)
-        }
-
-        fn profile_bindings(
-            &self,
-            _profile_name: &str,
-        ) -> AppResult<Vec<cowboy::domain::ProjectProfileBinding>> {
-            Ok(Vec::new())
-        }
-
-        fn profile_file_path(&self, name: &str) -> AppResult<std::path::PathBuf> {
-            Ok(self.profile_file_path.join(format!("settings.{name}.json")))
-        }
-
-        fn copy_profile(
-            &self,
-            _source: &str,
-            _new_name: &str,
-        ) -> AppResult<cowboy::claude_env::ClaudeProfile> {
-            Err("not used in this test".to_string())
-        }
-    }
-
-    fn app_with_profile_spy(
-        profile: cowboy::claude_env::ClaudeProfile,
-        repository: SpyProfileRepository,
-    ) -> Stetson<FakeRepository, FakeLauncher, SpyProfileRepository> {
-        let application =
-            StetsonApplication::with_profiles(FakeRepository, FakeLauncher, repository);
-        let mut app = Stetson::new(application);
-        app.state.main_tab = MainTab::Profiles;
-        app.state.profiles = vec![profile];
-        app
-    }
-
-    fn app_with_projects_and_profiles(
-        projects: Vec<Project>,
-        profiles: Vec<cowboy::claude_env::ClaudeProfile>,
-        repository: SpyProfileRepository,
-    ) -> Stetson<FakeRepository, FakeLauncher, SpyProfileRepository> {
-        let application =
-            StetsonApplication::with_profiles(FakeRepository, FakeLauncher, repository);
-        let mut app = Stetson::new(application);
-        app.state.projects = projects;
-        app.state.profiles = profiles;
-        app
-    }
-
-    fn spy_profile_repository(
-        profiles: Vec<cowboy::claude_env::ClaudeProfile>,
-    ) -> SpyProfileRepository {
-        SpyProfileRepository {
-            profiles,
-            activated_profiles: Rc::new(RefCell::new(Vec::new())),
-            bind_calls: Rc::new(RefCell::new(Vec::new())),
-            unbind_calls: Rc::new(RefCell::new(Vec::new())),
-            profile_file_path: PathBuf::from("/test/profiles"),
-        }
     }
 
     fn app_with_projects(projects: Vec<Project>) -> Stetson<FakeRepository, FakeLauncher> {
@@ -1722,7 +1009,6 @@ mod tests {
                 "/work/repo",
                 vec![session("session-1", "/work/repo")],
             )]),
-            profiles: Ok((Vec::new(), None)),
         });
 
         assert_eq!(app.state.projects.len(), 1);
@@ -2332,554 +1618,38 @@ mod tests {
     }
 
     #[test]
-    fn bracket_keys_cycle_tabs_and_align_browser_focus() {
+    fn bracket_navigation_cycles_only_projects_and_sessions() {
         let mut app = app_with_projects(Vec::new());
 
-        app.handle_key(key_char(']'));
-        assert_eq!(app.state.main_tab, MainTab::Profiles);
-
-        app.handle_key(key_char(']'));
-        assert_eq!(app.state.main_tab, MainTab::Projects);
-        assert_eq!(app.state.focus, FocusPane::Projects);
-
-        app.handle_key(key_char('['));
-        assert_eq!(app.state.main_tab, MainTab::Profiles);
+        for (key, expected) in [
+            (']', FocusPane::Sessions),
+            (']', FocusPane::Projects),
+            ('[', FocusPane::Sessions),
+            ('[', FocusPane::Projects),
+        ] {
+            app.handle_key(key_char(key));
+            assert_eq!(app.state.focus, expected);
+        }
     }
 
     #[test]
-    fn profile_tab_ignores_pane_keys_and_space_has_no_effect() {
-        use cowboy::claude_env::ClaudeProfile;
+    fn former_profile_shortcuts_leave_project_actions_available() {
+        let mut app = app_with_projects(vec![project(
+            "/work/repo",
+            vec![session("s1", "/work/repo")],
+        )]);
 
-        let mut app = app_with_projects(Vec::new());
-        app.state.main_tab = MainTab::Profiles;
-        app.state.profiles = vec![ClaudeProfile {
-            id: 7,
-            name: "work".to_string(),
-            settings_json: "{}".to_string(),
-            updated_at: "2026-08-08 00:00:00".to_string(),
-        }];
-        let focus = app.state.focus;
-
-        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
-        assert_eq!(app.state.focus, focus);
-
-        // With only one profile the cursor sits on it; pressing Down must not
-        // move past the end (the snapshot subpanel no longer extends the list).
-        app.handle_key(key_char(' '));
-        assert_eq!(app.state.profile_cursor, 0);
-        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        app.handle_key(key_char(' '));
-        assert_eq!(app.state.profile_cursor, 0);
-    }
-
-    #[test]
-    fn ctrl_d_in_profiles_starts_delete_profile() {
-        use cowboy::claude_env::ClaudeProfile;
-
-        let mut app = app_with_projects(Vec::new());
-        app.state.main_tab = MainTab::Profiles;
-        app.state.profiles = vec![ClaudeProfile {
-            id: 7,
-            name: "work".to_string(),
-            settings_json: "{}".to_string(),
-            updated_at: "2026-08-08 00:00:00".to_string(),
-        }];
-
-        app.handle_key(ctrl_d());
-
-        assert_eq!(app.state.modal, ModalState::DeleteConfirm);
-        assert!(matches!(
-            app.state.delete_target.as_ref(),
-            Some(DeleteTarget::Profile { name, .. }) if name == "work"
-        ));
-    }
-
-    #[test]
-    fn enter_in_profiles_activates_the_focused_profile() {
-        use cowboy::claude_env::ClaudeProfile;
-
-        let profile = ClaudeProfile {
-            id: 7,
-            name: "work".to_string(),
-            settings_json: "{}".to_string(),
-            updated_at: "2026-08-08 00:00:00".to_string(),
-        };
-        let activated_profiles = Rc::new(RefCell::new(Vec::new()));
-        let repository = SpyProfileRepository {
-            profiles: vec![profile.clone()],
-            activated_profiles: activated_profiles.clone(),
-            bind_calls: Rc::new(RefCell::new(Vec::new())),
-            unbind_calls: Rc::new(RefCell::new(Vec::new())),
-            profile_file_path: PathBuf::from("/test/profiles"),
-        };
-        let mut app = app_with_profile_spy(profile, repository);
-
+        for ch in ['e', 'u', 'p'] {
+            let status = app.state.status.clone();
+            app.handle_key(key_char(ch));
+            assert_eq!(app.state.modal, ModalState::None);
+            assert_eq!(app.state.status, status, "former shortcut: {ch}");
+            assert!(!app.state.should_quit);
+        }
         app.handle_key(enter_key());
-
-        assert_eq!(*activated_profiles.borrow(), vec!["work"]);
-        assert_eq!(app.state.status, "Activated profile: work");
-    }
-
-    #[test]
-    fn terminal_refresh_request_is_consumed_once() {
-        let mut app = app_with_projects(Vec::new());
-        app.state.terminal_refresh_pending = true;
-
-        assert!(app.take_terminal_refresh_request());
-        assert!(!app.take_terminal_refresh_request());
-    }
-
-    // ── Bind profile tests ──────────────────────────────────────────────
-
-    #[test]
-    fn b_key_opens_bind_profile_modal() {
-        let profile = cowboy::claude_env::ClaudeProfile {
-            id: 1,
-            name: "work".to_string(),
-            settings_json: "{}".to_string(),
-            updated_at: "2026-08-08 00:00:00".to_string(),
-        };
-        let repository = spy_profile_repository(vec![profile.clone()]);
-        let mut app = app_with_projects_and_profiles(
-            vec![project("/work/repo", vec![session("s1", "/work/repo")])],
-            vec![profile],
-            repository,
-        );
-        app.state.focus = FocusPane::Projects;
-
-        app.handle_key(key_char('e'));
-
-        assert!(matches!(
-            app.state.modal,
-            ModalState::BindProfile { profile_cursor: 0 }
-        ));
-        assert_eq!(app.state.status, "Select profile to bind");
-    }
-
-    #[test]
-    fn e_key_on_open_here_shows_toast() {
-        let profile = cowboy::claude_env::ClaudeProfile {
-            id: 1,
-            name: "work".to_string(),
-            settings_json: "{}".to_string(),
-            updated_at: "2026-08-08 00:00:00".to_string(),
-        };
-        let repository = spy_profile_repository(vec![profile.clone()]);
-        let mut app = app_with_projects_and_profiles(
-            vec![project("/work/repo", vec![session("s1", "/work/repo")])],
-            vec![profile],
-            repository,
-        );
-        app.state.focus = FocusPane::Projects;
-        app.state.selected_project = 1; // Open Here
-
-        app.handle_key(key_char('e'));
-
-        assert_eq!(app.state.modal, ModalState::None);
-        assert!(app.state.toast.is_some());
-    }
-
-    #[test]
-    fn bind_profile_modal_escape_cancels() {
-        let mut app = app_with_projects(Vec::new());
-        app.state.modal = ModalState::BindProfile { profile_cursor: 0 };
-
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-
-        assert_eq!(app.state.modal, ModalState::None);
-        assert_eq!(app.state.status, "Bind profile canceled");
-    }
-
-    #[test]
-    fn bind_profile_modal_down_moves_cursor() {
-        let profile1 = cowboy::claude_env::ClaudeProfile {
-            id: 1,
-            name: "work".to_string(),
-            settings_json: "{}".to_string(),
-            updated_at: "2026-08-08 00:00:00".to_string(),
-        };
-        let profile2 = cowboy::claude_env::ClaudeProfile {
-            id: 2,
-            name: "personal".to_string(),
-            settings_json: "{}".to_string(),
-            updated_at: "2026-08-08 00:00:00".to_string(),
-        };
-        let repository = spy_profile_repository(vec![profile1.clone(), profile2.clone()]);
-        let mut app = app_with_projects_and_profiles(
-            vec![project("/work/repo", vec![session("s1", "/work/repo")])],
-            vec![profile1, profile2],
-            repository,
-        );
-        app.state.modal = ModalState::BindProfile { profile_cursor: 0 };
-
-        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-
-        match app.state.modal {
-            ModalState::BindProfile { profile_cursor } => assert_eq!(profile_cursor, 1),
-            _ => panic!("Expected BindProfile modal"),
-        }
-    }
-
-    #[test]
-    fn bind_profile_modal_up_moves_cursor() {
-        let profile1 = cowboy::claude_env::ClaudeProfile {
-            id: 1,
-            name: "work".to_string(),
-            settings_json: "{}".to_string(),
-            updated_at: "2026-08-08 00:00:00".to_string(),
-        };
-        let profile2 = cowboy::claude_env::ClaudeProfile {
-            id: 2,
-            name: "personal".to_string(),
-            settings_json: "{}".to_string(),
-            updated_at: "2026-08-08 00:00:00".to_string(),
-        };
-        let repository = spy_profile_repository(vec![profile1.clone(), profile2.clone()]);
-        let mut app = app_with_projects_and_profiles(
-            vec![project("/work/repo", vec![session("s1", "/work/repo")])],
-            vec![profile1, profile2],
-            repository,
-        );
-        app.state.modal = ModalState::BindProfile { profile_cursor: 1 };
-
-        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-
-        match app.state.modal {
-            ModalState::BindProfile { profile_cursor } => assert_eq!(profile_cursor, 0),
-            _ => panic!("Expected BindProfile modal"),
-        }
-    }
-
-    #[test]
-    fn bind_profile_modal_enter_binds_profile() {
-        let profile = cowboy::claude_env::ClaudeProfile {
-            id: 1,
-            name: "work".to_string(),
-            settings_json: "{}".to_string(),
-            updated_at: "2026-08-08 00:00:00".to_string(),
-        };
-        let repository = spy_profile_repository(vec![profile.clone()]);
-        let mut app = app_with_projects_and_profiles(
-            vec![project("/work/repo", vec![session("s1", "/work/repo")])],
-            vec![profile],
-            repository.clone(),
-        );
-        app.state.modal = ModalState::BindProfile { profile_cursor: 0 };
-
-        app.handle_key(enter_key());
-
-        assert_eq!(app.state.modal, ModalState::None);
-        assert_eq!(app.state.status, "Bound profile 'work' to project");
-        let bind_calls = repository.bind_calls.borrow();
-        assert_eq!(bind_calls.len(), 1);
-        assert_eq!(bind_calls[0].0, PathBuf::from("/work/repo"));
-        assert_eq!(bind_calls[0].1, "work");
-    }
-
-    #[test]
-    fn u_key_unbinds_current_project() {
-        let profile = cowboy::claude_env::ClaudeProfile {
-            id: 1,
-            name: "work".to_string(),
-            settings_json: "{}".to_string(),
-            updated_at: "2026-08-08 00:00:00".to_string(),
-        };
-        let repository = spy_profile_repository(vec![profile.clone()]);
-        let mut app = app_with_projects_and_profiles(
-            vec![project("/work/repo", vec![session("s1", "/work/repo")])],
-            vec![profile],
-            repository.clone(),
-        );
-        app.state.focus = FocusPane::Projects;
-
-        app.handle_key(key_char('u'));
-
-        assert_eq!(app.state.status, "Profile unbound");
-        let unbind_calls = repository.unbind_calls.borrow();
-        assert_eq!(unbind_calls.len(), 1);
-        assert_eq!(unbind_calls[0], PathBuf::from("/work/repo"));
-    }
-
-    #[test]
-    fn u_key_on_open_here_shows_toast() {
-        let profile = cowboy::claude_env::ClaudeProfile {
-            id: 1,
-            name: "work".to_string(),
-            settings_json: "{}".to_string(),
-            updated_at: "2026-08-08 00:00:00".to_string(),
-        };
-        let repository = spy_profile_repository(vec![profile.clone()]);
-        let mut app = app_with_projects_and_profiles(
-            vec![project("/work/repo", vec![session("s1", "/work/repo")])],
-            vec![profile],
-            repository,
-        );
-        app.state.focus = FocusPane::Projects;
-        app.state.selected_project = 1; // Open Here
-
-        app.handle_key(key_char('u'));
-
-        assert!(app.state.toast.is_some());
-    }
-
-    #[test]
-    fn bind_profile_modal_down_clamps_at_last_profile() {
-        let profile = cowboy::claude_env::ClaudeProfile {
-            id: 1,
-            name: "work".to_string(),
-            settings_json: "{}".to_string(),
-            updated_at: "2026-08-08 00:00:00".to_string(),
-        };
-        let repository = spy_profile_repository(vec![profile.clone()]);
-        let mut app = app_with_projects_and_profiles(
-            vec![project("/work/repo", vec![session("s1", "/work/repo")])],
-            vec![profile],
-            repository,
-        );
-        app.state.modal = ModalState::BindProfile { profile_cursor: 0 };
-
-        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-
-        match app.state.modal {
-            ModalState::BindProfile { profile_cursor } => assert_eq!(profile_cursor, 0),
-            _ => panic!("Expected BindProfile modal"),
-        }
-    }
-
-    #[test]
-    fn bind_profile_modal_up_clamps_at_first_profile() {
-        let profile = cowboy::claude_env::ClaudeProfile {
-            id: 1,
-            name: "work".to_string(),
-            settings_json: "{}".to_string(),
-            updated_at: "2026-08-08 00:00:00".to_string(),
-        };
-        let repository = spy_profile_repository(vec![profile.clone()]);
-        let mut app = app_with_projects_and_profiles(
-            vec![project("/work/repo", vec![session("s1", "/work/repo")])],
-            vec![profile],
-            repository,
-        );
-        app.state.modal = ModalState::BindProfile { profile_cursor: 0 };
-
-        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-
-        match app.state.modal {
-            ModalState::BindProfile { profile_cursor } => assert_eq!(profile_cursor, 0),
-            _ => panic!("Expected BindProfile modal"),
-        }
-    }
-
-    // ── PickProfile tests ─────────────────────────────────────────────────
-
-    #[test]
-    fn p_key_on_project_enters_pick_profile_modal() {
-        let profile = cowboy::claude_env::ClaudeProfile {
-            id: 1,
-            name: "work".to_string(),
-            settings_json: "{}".to_string(),
-            updated_at: "2026-08-08 00:00:00".to_string(),
-        };
-        let repository = spy_profile_repository(vec![profile.clone()]);
-        let mut app = app_with_projects_and_profiles(
-            vec![project("/work/repo", vec![session("s1", "/work/repo")])],
-            vec![profile],
-            repository,
-        );
-        app.state.focus = FocusPane::Projects;
-
-        app.handle_key(key_char('p'));
-
-        assert!(matches!(
-            app.state.modal,
-            ModalState::PickProfile { profile_cursor: 0 }
-        ));
-    }
-
-    #[test]
-    fn p_key_on_open_here_is_ignored() {
-        let profile = cowboy::claude_env::ClaudeProfile {
-            id: 1,
-            name: "work".to_string(),
-            settings_json: "{}".to_string(),
-            updated_at: "2026-08-08 00:00:00".to_string(),
-        };
-        let repository = spy_profile_repository(vec![profile.clone()]);
-        let mut app = app_with_projects_and_profiles(
-            vec![project("/work/repo", vec![session("s1", "/work/repo")])],
-            vec![profile],
-            repository,
-        );
-        app.state.focus = FocusPane::Projects;
-        app.state.selected_project = 1; // Open Here
-
-        app.handle_key(key_char('p'));
-
-        assert_eq!(app.state.modal, ModalState::None);
-        assert!(!app.state.should_quit);
-        assert_eq!(app.state.pending_new_session, None);
-    }
-
-    #[test]
-    fn enter_in_pick_profile_sets_override_and_quits() {
-        let profile = cowboy::claude_env::ClaudeProfile {
-            id: 1,
-            name: "work".to_string(),
-            settings_json: "{}".to_string(),
-            updated_at: "2026-08-08 00:00:00".to_string(),
-        };
-        let repository = spy_profile_repository(vec![profile.clone()]);
-        let mut app = app_with_projects_and_profiles(
-            vec![project("/work/repo", vec![session("s1", "/work/repo")])],
-            vec![profile],
-            repository.clone(),
-        );
-        app.state.modal = ModalState::PickProfile { profile_cursor: 0 };
-
-        app.handle_key(enter_key());
-
-        assert_eq!(app.state.modal, ModalState::None);
-        assert!(app.state.should_quit);
-        assert_eq!(
-            app.state.pending_profile_override,
-            Some(PathBuf::from("/test/profiles/settings.work.json"))
-        );
         assert_eq!(
             app.state.pending_new_session,
             Some(PathBuf::from("/work/repo"))
         );
-    }
-
-    #[test]
-    fn q_in_pick_profile_cancels_and_returns_to_none() {
-        let profile = cowboy::claude_env::ClaudeProfile {
-            id: 1,
-            name: "work".to_string(),
-            settings_json: "{}".to_string(),
-            updated_at: "2026-08-08 00:00:00".to_string(),
-        };
-        let repository = spy_profile_repository(vec![profile.clone()]);
-        let mut app = app_with_projects_and_profiles(
-            vec![project("/work/repo", vec![session("s1", "/work/repo")])],
-            vec![profile],
-            repository,
-        );
-        app.state.modal = ModalState::PickProfile { profile_cursor: 0 };
-
-        app.handle_key(key_char('q'));
-
-        assert_eq!(app.state.modal, ModalState::None);
-        assert!(!app.state.should_quit);
-    }
-
-    #[test]
-    fn pending_profile_override_is_cleared_after_resume_finished() {
-        let mut app = app_with_projects(Vec::new());
-        app.state.pending_profile_override =
-            Some(PathBuf::from("/test/profiles/settings.work.json"));
-
-        app.resume_finished("test status");
-
-        assert!(app.state.pending_profile_override.is_none());
-    }
-
-    // ── Profile copy tests ────────────────────────────────────────────────
-
-    #[test]
-    fn c_key_in_profiles_tab_opens_copy_modal() {
-        let profile = cowboy::claude_env::ClaudeProfile {
-            id: 1,
-            name: "work".to_string(),
-            settings_json: "{}".to_string(),
-            updated_at: "2026-08-08 00:00:00".to_string(),
-        };
-        let repository = spy_profile_repository(vec![profile.clone()]);
-        let mut app = app_with_projects_and_profiles(
-            vec![project("/work/repo", vec![session("s1", "/work/repo")])],
-            vec![profile],
-            repository,
-        );
-        app.state.main_tab = MainTab::Profiles;
-        app.state.profile_cursor = 0;
-
-        app.handle_key(key_char('c'));
-
-        assert_eq!(app.state.modal, ModalState::CopyProfile);
-        assert_eq!(app.state.input_buffer, "Copy of work");
-        assert!(app.state.status.contains("Copy profile"));
-    }
-
-    #[test]
-    fn c_key_on_profile_list_opens_copy_modal_even_when_cursor_at_boundary() {
-        let profile = cowboy::claude_env::ClaudeProfile {
-            id: 1,
-            name: "work".to_string(),
-            settings_json: "{}".to_string(),
-            updated_at: "2026-08-08 00:00:00".to_string(),
-        };
-        let repository = spy_profile_repository(vec![profile.clone()]);
-        let mut app = app_with_projects_and_profiles(
-            vec![project("/work/repo", vec![session("s1", "/work/repo")])],
-            vec![profile],
-            repository,
-        );
-        app.state.main_tab = MainTab::Profiles;
-        // Cursor on the only profile (boundary value).
-        app.state.profile_cursor = 0;
-
-        app.handle_key(key_char('c'));
-
-        assert_eq!(app.state.modal, ModalState::CopyProfile);
-    }
-
-    #[test]
-    fn escape_in_copy_modal_cancels_and_closes() {
-        let profile = cowboy::claude_env::ClaudeProfile {
-            id: 1,
-            name: "work".to_string(),
-            settings_json: "{}".to_string(),
-            updated_at: "2026-08-08 00:00:00".to_string(),
-        };
-        let repository = spy_profile_repository(vec![profile.clone()]);
-        let mut app = app_with_projects_and_profiles(
-            vec![project("/work/repo", vec![session("s1", "/work/repo")])],
-            vec![profile],
-            repository,
-        );
-        app.state.main_tab = MainTab::Profiles;
-        app.state.profile_cursor = 0;
-        app.handle_key(key_char('c')); // open copy modal
-        assert_eq!(app.state.modal, ModalState::CopyProfile);
-
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-
-        assert_eq!(app.state.modal, ModalState::None);
-        assert!(app.state.input_buffer.is_empty());
-        assert!(app.state.status.contains("Copy canceled"));
-    }
-
-    #[test]
-    fn copy_modal_pre_fills_with_copy_of_source_name() {
-        let profile = cowboy::claude_env::ClaudeProfile {
-            id: 1,
-            name: "my-profile".to_string(),
-            settings_json: "{}".to_string(),
-            updated_at: "2026-08-08 00:00:00".to_string(),
-        };
-        let repository = spy_profile_repository(vec![profile.clone()]);
-        let mut app = app_with_projects_and_profiles(
-            vec![project("/work/repo", vec![session("s1", "/work/repo")])],
-            vec![profile],
-            repository,
-        );
-        app.state.main_tab = MainTab::Profiles;
-        app.state.profile_cursor = 0;
-
-        app.handle_key(key_char('c'));
-
-        assert_eq!(app.state.input_buffer, "Copy of my-profile");
     }
 }

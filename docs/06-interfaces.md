@@ -4,58 +4,37 @@
 
 - `SessionRepository`
   - `load_projects()`
-  - `rename_session(session_id, new_title)`
-  - `delete_session(session_id)`
+  - `rename_session(session_key, new_title)`
+  - `delete_session(session_key)`
   - `delete_project(project_cwd)`
 - `ResumeLauncher`
   - `resume(target)`
   - `launch_new(cwd)`
-  - child processes inherit the current process environment
-- `ProfileRepository`
-  - `list_profiles()`
-  - `active_profile_name()`
-  - `activate_profile(name)`
+  - Child processes inherit the current environment and load their own settings.
 
 ## Metadata store
 
-`ClaudeEnvStore` retains its historical name but now owns generic settings,
-themes, Profiles, and activation recovery. The public Profile API is:
-
-- `list_profiles`, `create_profile`, `profile`, `update_profile_json`, `delete_profile`
-- `activate_profile`, `active_profile_name`
-- `recover_profile_activation`
-- `perform_initial_backup` — one-shot file backup of `settings.json` to
-  `settings.json.cowboy-backup`, gated by the `initial_backup_done` flag in
-  the `settings` table
-- `claude_config_dir`, `global_settings_path`
-
-All Profile names and settings JSON are validated by shared helpers.
+`ClaudeEnvStore` owns SQLite-backed paths, launcher settings, and themes.
+`claude_config_dir` and `claude_projects_dir` resolve configured paths.
+Legacy Profile data is no longer used and is left untouched.
 
 ## CLI
 
 ```text
-config list
-config create <name>
-config edit <name>
-config delete <name>
-config activate <name>
-config bind <project-path> <profile-name>
-config unbind <project-path>
-config copy <source> <new-name>
+cowboy
+cowboy alias <command>
+cowboy --help
 ```
 
-`config edit` updates SQLite only after `$EDITOR` exits successfully and the
-result parses as a JSON object. Invalid edits remain in a private temporary file.
+Without a configured alias the launcher defaults to `claude`.
 
 ## TUI state
 
-- `MainTab`: `Projects` or `Profiles`
-- `FocusPane`: `Projects` or `Sessions`, independent of `MainTab`
-- Profiles state: rows and active Profile name (no snapshot subpanel)
-- `[`/`]` changes `MainTab`; browser `Tab`/`←`/`→` changes `FocusPane`; those keys are no-ops in Profiles
+- `FocusPane`: `Projects` or `Sessions`; the top tabs reflect the current focus.
+- `[` / `]`, `Tab`, and the left/right arrows toggle focus.
 
-## SQL references
+## Historical references
 
-- `docs/sql/01_metadata_schema.sql`: canonical version-1 schema
-- `docs/sql/02_legacy_migration.sql`: legacy cleanup transaction reference
-- `docs/07-profiles-plan.md`: complete migration, activation, CLI, TUI, and acceptance semantics (note: snapshot-related sections are now historical)
+- `docs/sql/01_metadata_schema.sql`: historical version-1 schema, not the current initialization SQL.
+- `docs/sql/02_legacy_migration.sql`: legacy environment cleanup transaction reference.
+- `docs/07-profiles-plan.md`: historical Profile design; see the [upgrade notes](../README.md#upgrading-from-a-release-with-profiles) for current behavior.
