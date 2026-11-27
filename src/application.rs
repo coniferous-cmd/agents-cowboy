@@ -207,15 +207,57 @@ impl SessionRepository for PiBackend {
 #[derive(Clone)]
 pub struct PiCliLauncher;
 impl PiCliLauncher {
+    #[cfg(windows)]
+    fn windows_command() -> std::io::Result<Command> {
+        use std::env;
+        let dirs: Vec<_> = env::split_paths(&env::var_os("PATH").unwrap_or_default())
+            .filter(|dir| dir.is_absolute())
+            .collect();
+        // Git for Windows can expose cmd, bin, usr/bin or mingw64/bin on PATH.
+        // git-bash.exe identifies the installation; never launch that GUI wrapper.
+        let roots = dirs
+            .iter()
+            .flat_map(|dir| dir.ancestors().take(3).map(Path::to_owned))
+            .chain(
+                ["ProgramFiles", "ProgramFiles(x86)"]
+                    .into_iter()
+                    .filter_map(env::var_os)
+                    .map(|dir| PathBuf::from(dir).join("Git")),
+            )
+            .chain(env::var_os("LOCALAPPDATA").map(|dir| PathBuf::from(dir).join("Programs/Git")));
+        for root in roots {
+            let bash = root.join("bin/bash.exe");
+            if root.join("git-bash.exe").is_file() && bash.is_file() {
+                let mut command = Command::new(bash);
+                // $0 is a placeholder; session arguments remain positional data.
+                command.args(["-c", r#"exec pi "$@""#, "pi"]);
+                return Ok(command);
+            }
+        }
+        for name in ["pi.exe", "pi.cmd"] {
+            if let Some(path) = dirs.iter().map(|dir| dir.join(name)).find(|p| p.is_file()) {
+                return Ok(Command::new(path));
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Git Bash not found; neither pi.exe nor pi.cmd found on PATH",
+        ))
+    }
+
+    #[cfg(not(windows))]
     fn command(cwd: &Path, args: &[&str]) -> Command {
         let mut cmd = Command::new("pi");
         cmd.current_dir(cwd).args(args);
         cmd
     }
     fn launch(&self, cwd: &Path, args: &[&str]) -> AppResult<()> {
-        let status = Self::command(cwd, args)
-            .status()
-            .map_err(|e| format!("Failed to launch Pi: {e}"))?;
+        #[cfg(windows)]
+        let result =
+            Self::windows_command().and_then(|mut cmd| cmd.current_dir(cwd).args(args).status());
+        #[cfg(not(windows))]
+        let result = Self::command(cwd, args).status();
+        let status = result.map_err(|e| format!("Failed to launch Pi: {e}"))?;
         if status.success() {
             Ok(())
         } else {
