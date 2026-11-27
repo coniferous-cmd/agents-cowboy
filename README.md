@@ -162,7 +162,11 @@ New and resumed Claude processes inherit the current environment and load their 
 
 ### Upgrading from a release with Profiles
 
-`cowboy config` and project Profile bindings no longer work. Cowboy leaves old Profile files and database records, `settings.json`, and any `settings.json.cowboy-backup` untouched.
+`cowboy config` is retired, and project Profile bindings no longer affect launches. On first startup, metadata schema v5 permanently removes `claude_profiles`, `project_profile_bindings`, `profile_activation_journal`, and `claude_settings_snapshots` from SQLite, along with their indexes and triggers. It also removes `active_profile_name` from `settings`. Other settings (including paths and the launcher alias) and themes are retained. For v0/v1 databases, Cowboy still exports legacy project settings before deleting the old environment tables.
+
+**Back up `cowboy.db` before first launch.** Close all Cowboy instances and use SQLite's backup command to create a consistent copy, for example `sqlite3 "/path/to/cowboy.db" ".backup '/path/to/cowboy-before-v5.db'"`. Keep the copy separate from the live database. Downgrading alone will not restore deleted records, and older Cowboy binaries may reject v5. To roll back, close Cowboy, move the upgraded database and any `-wal`, `-shm`, or `-journal` sidecars aside, restore the backup at the original database path, and run a compatible older binary. Changes made after the backup will not be in the restored database.
+
+The SQLite cleanup does not touch legacy Profile files, Claude's `settings.json` (regular file or symlink), the link target, or any `settings.json.cowboy-backup`.
 
 If `settings.json` is a symlink to a legacy Profile file, **do not delete the target** while Claude still uses it. To keep the settings currently in effect and remove that dependency:
 

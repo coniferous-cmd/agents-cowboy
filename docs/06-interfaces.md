@@ -16,7 +16,9 @@
 
 `ClaudeEnvStore` owns SQLite-backed paths, launcher settings, and themes.
 `claude_config_dir` and `claude_projects_dir` resolve configured paths.
-Legacy Profile data is no longer used and is left untouched.
+Schema v5 keeps `settings` and `themes` as Cowboy's only supported metadata tables. The one-time upgrade drops `claude_profiles`, `project_profile_bindings`, `profile_activation_journal`, and `claude_settings_snapshots` with their table-owned indexes and triggers, and removes only `active_profile_name` from `settings`. Existing paths, aliases, and themes remain. The schema changes and version bump commit together; an SQL failure leaves the previous committed database intact. For v0/v1, a legacy project-settings export can remain on disk if a later SQL step rolls back.
+
+The migration does not alter regular Claude settings, a settings symlink or its target, legacy Profile files, or existing settings backups. Back up `cowboy.db` before first launch. Downgrading alone does not restore removed records; restore the pre-upgrade database with Cowboy closed and use a compatible binary. See the [upgrade notes](../README.md#upgrading-from-a-release-with-profiles) for backup, restore, and symlink guidance.
 
 ## CLI
 

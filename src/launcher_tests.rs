@@ -7,7 +7,7 @@ use std::{env, fs, path::PathBuf, process::Command};
 const SETTING_CLAUDE_COMMAND_ALIAS: &str = "claude_command_alias";
 
 #[test]
-fn launching_bound_projects_leaves_settings_to_claude() {
+fn launching_previously_bound_projects_uses_alias_without_profile_arguments() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let project = root.join("project");
@@ -17,8 +17,9 @@ fn launching_bound_projects_leaves_settings_to_claude() {
     store.initialize().unwrap();
     let db = Connection::open(&db_path).unwrap();
     db.execute_batch(
-        "CREATE TABLE IF NOT EXISTS claude_profiles (id INTEGER PRIMARY KEY, name TEXT UNIQUE, settings_json TEXT, updated_at TEXT DEFAULT '');
-         CREATE TABLE IF NOT EXISTS project_profile_bindings (project_cwd TEXT PRIMARY KEY, profile_name TEXT);
+        "PRAGMA user_version=4;
+         CREATE TABLE claude_profiles (id INTEGER PRIMARY KEY, name TEXT UNIQUE, settings_json TEXT, updated_at TEXT DEFAULT '');
+         CREATE TABLE project_profile_bindings (project_cwd TEXT PRIMARY KEY, profile_name TEXT);
          INSERT INTO claude_profiles (name, settings_json) VALUES ('work', '{}');",
     ).unwrap();
     db.execute(
@@ -59,6 +60,13 @@ fn main() {
     let alias = root.join(format!("custom-claude{}", env::consts::EXE_SUFFIX));
     fs::copy(&fake, &alias).unwrap();
     fs::copy(&fake, root.join(format!("pi{}", env::consts::EXE_SUFFIX))).unwrap();
+    store
+        .upsert_setting(&Setting {
+            key: SETTING_CLAUDE_COMMAND_ALIAS.into(),
+            value: alias.display().to_string(),
+        })
+        .unwrap();
+    store.initialize().unwrap();
     let path = env::join_paths(
         std::iter::once(root.to_path_buf()).chain(
             env::var_os("PATH")
@@ -73,16 +81,10 @@ fn main() {
         ("pi-new", "pi", &[][..]),
         ("pi-resume", "pi", &["--session", "session-123"][..]),
         ("new", "custom-claude", &[][..]),
-        ("resume", "claude", &["--resume", "session-123"][..]),
+        ("resume", "custom-claude", &["--resume", "session-123"][..]),
+        ("resume-default", "claude", &["--resume", "session-123"][..]),
     ] {
-        if mode == "new" {
-            store
-                .upsert_setting(&Setting {
-                    key: SETTING_CLAUDE_COMMAND_ALIAS.into(),
-                    value: alias.display().to_string(),
-                })
-                .unwrap();
-        } else {
+        if mode == "resume-default" {
             db.execute(
                 "DELETE FROM settings WHERE key=?1",
                 [SETTING_CLAUDE_COMMAND_ALIAS],
@@ -121,6 +123,10 @@ fn main() {
         }
     }
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    assert_eq!(
+        fs::read(root.join("profiles/settings.work.json")).unwrap(),
+        b"{}"
+    );
 }
 
 #[test]

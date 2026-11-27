@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use super::files::{ensure_private_dir, AtomicReplace};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const SETTINGS_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS settings (
     id INTEGER PRIMARY KEY,
@@ -32,50 +32,30 @@ pub(super) fn initialize_schema(
     connection: &mut Connection,
     default_config_dir: &Path,
 ) -> Result<()> {
-    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version > SCHEMA_VERSION {
-        return Err(StetsonError::UnsupportedSchemaVersion(version));
-    }
-    if version >= 2 {
-        // Versions 2–4 already have the retained metadata layout. Leave their
-        // version and retired Profile tables alone, including pending journal rows.
-        connection.execute_batch(SETTINGS_SCHEMA)?;
-        connection.execute_batch(THEMES_SCHEMA)?;
+    if supported_version(connection)? == SCHEMA_VERSION {
         return Ok(());
     }
 
-    let config_dir =
-        configured_claude_dir(connection)?.unwrap_or_else(|| default_config_dir.to_path_buf());
-    let projects = legacy_project_rows(connection)?;
-    if !projects.is_empty() {
-        write_legacy_dump(&config_dir, &projects)?;
-    }
-
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    normalize_settings_table(&transaction)?;
-    transaction.execute_batch(THEMES_SCHEMA)?;
+    // Another initializer may have finished while we waited for the write lock.
+    let version = supported_version(&transaction)?;
+    if version == SCHEMA_VERSION {
+        return Ok(());
+    }
 
-    for index in [
-        "idx_claude_env_value_env_name",
-        "idx_claude_env_values_env_name",
-        "idx_claude_env_values_env_id",
-    ] {
-        transaction.execute(&format!("DROP INDEX IF EXISTS {index}"), [])?;
+    if version < 2 {
+        migrate_legacy_environment(&transaction, default_config_dir)?;
+    } else {
+        transaction.execute_batch(SETTINGS_SCHEMA)?;
     }
-    for table in [
-        "claude_env_value",
-        "claude_env_values",
-        "claude_env_value_legacy",
-        "claude_env_values_legacy",
-        "claude_project_settings",
-        "claude_project_settings_legacy",
-        "claude_env",
-        "claude_envs",
-        "claude_env_legacy",
-        "claude_envs_legacy",
-    ] {
-        transaction.execute(&format!("DROP TABLE IF EXISTS {table}"), [])?;
-    }
+    transaction.execute_batch(THEMES_SCHEMA)?;
+    transaction.execute_batch(
+        "DROP TABLE IF EXISTS project_profile_bindings;
+         DROP TABLE IF EXISTS profile_activation_journal;
+         DROP TABLE IF EXISTS claude_settings_snapshots;
+         DROP TABLE IF EXISTS claude_profiles;
+         DELETE FROM settings WHERE key='active_profile_name';",
+    )?;
 
     let violations = {
         let mut statement = transaction.prepare("PRAGMA foreign_key_check")?;
@@ -93,6 +73,47 @@ pub(super) fn initialize_schema(
     }
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
+    Ok(())
+}
+
+fn supported_version(connection: &Connection) -> Result<i64> {
+    let version = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version > SCHEMA_VERSION {
+        return Err(StetsonError::UnsupportedSchemaVersion(version));
+    }
+    Ok(version)
+}
+
+fn migrate_legacy_environment(connection: &Connection, default_config_dir: &Path) -> Result<()> {
+    let projects = legacy_project_rows(connection)?;
+    if !projects.is_empty() {
+        let config_dir =
+            configured_claude_dir(connection)?.unwrap_or_else(|| default_config_dir.to_path_buf());
+        write_legacy_dump(&config_dir, &projects)?;
+    }
+    normalize_settings_table(connection)?;
+
+    for index in [
+        "idx_claude_env_value_env_name",
+        "idx_claude_env_values_env_name",
+        "idx_claude_env_values_env_id",
+    ] {
+        connection.execute(&format!("DROP INDEX IF EXISTS {index}"), [])?;
+    }
+    for table in [
+        "claude_env_value",
+        "claude_env_values",
+        "claude_env_value_legacy",
+        "claude_env_values_legacy",
+        "claude_project_settings",
+        "claude_project_settings_legacy",
+        "claude_env",
+        "claude_envs",
+        "claude_env_legacy",
+        "claude_envs_legacy",
+    ] {
+        connection.execute(&format!("DROP TABLE IF EXISTS {table}"), [])?;
+    }
     Ok(())
 }
 
@@ -213,7 +234,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_is_version_four_without_retired_tables() {
+    fn fresh_database_is_version_five_without_retired_tables() {
         let temp = tempdir().unwrap();
         let store = ClaudeEnvStore::new(temp.path().join("db/cowboy.db"));
         store.initialize().unwrap();
@@ -222,7 +243,7 @@ mod tests {
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            4
+            5
         );
         for table in ["settings", "themes"] {
             assert!(exists(&connection, table));
@@ -243,12 +264,24 @@ mod tests {
     }
 
     #[test]
-    fn migration_dumps_raw_text_and_preserves_custom_setting() {
+    fn v0_migration_dumps_raw_text_and_preserves_custom_setting() {
+        assert_legacy_migration(0, "claude_project_settings");
+    }
+
+    #[test]
+    fn v1_migration_dumps_raw_text_and_preserves_custom_setting() {
+        assert_legacy_migration(1, "claude_project_settings_legacy");
+    }
+
+    fn assert_legacy_migration(version: i64, table: &str) {
         let temp = tempdir().unwrap();
         let db = temp.path().join("cowboy.db");
         let config = temp.path().join("custom-claude");
         let connection = Connection::open(&db).unwrap();
-        connection.execute_batch("CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE claude_env(name TEXT PRIMARY KEY,category TEXT NOT NULL); CREATE TABLE claude_env_value(scope TEXT,env_name TEXT,env_value TEXT); CREATE TABLE claude_project_settings(project_path TEXT PRIMARY KEY,settings_json TEXT NOT NULL);").unwrap();
+        connection
+            .pragma_update(None, "user_version", version)
+            .unwrap();
+        connection.execute_batch(&format!("CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE claude_env(name TEXT PRIMARY KEY,category TEXT NOT NULL); CREATE TABLE claude_env_value(scope TEXT,env_name TEXT,env_value TEXT); CREATE TABLE {table}(project_path TEXT PRIMARY KEY,settings_json TEXT NOT NULL); INSERT INTO settings VALUES('active_profile_name','work'), ('claude_command_alias','keep-claude'); CREATE TABLE claude_profiles (name TEXT PRIMARY KEY);")).unwrap();
         connection
             .execute(
                 "INSERT INTO settings VALUES('claude_config_dir',?1)",
@@ -257,7 +290,7 @@ mod tests {
             .unwrap();
         connection
             .execute(
-                "INSERT INTO claude_project_settings VALUES('/repo','not-json')",
+                &format!("INSERT INTO {table} VALUES('/repo','not-json')"),
                 [],
             )
             .unwrap();
@@ -280,9 +313,44 @@ mod tests {
             .unwrap()
             .path();
         let value: serde_json::Value = serde_json::from_slice(&fs::read(dump).unwrap()).unwrap();
+        assert_eq!(value["projects"][0]["path"], "/repo");
         assert_eq!(value["projects"][0]["settings_json"], "not-json");
+        assert_eq!(store.claude_command_alias().unwrap(), "keep-claude");
+        assert_eq!(store.get_setting("active_profile_name").unwrap(), None);
         let connection = Connection::open(&db).unwrap();
-        assert!(!exists(&connection, "claude_project_settings"));
+        let tables = connection
+            .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(tables, ["settings", "themes"]);
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn future_schema_is_rejected_without_initialization() {
+        let temp = tempdir().unwrap();
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.pragma_update(None, "user_version", 6).unwrap();
+        assert!(matches!(
+            initialize_schema(&mut connection, temp.path()),
+            Err(StetsonError::UnsupportedSchemaVersion(6))
+        ));
+        assert!(!exists(&connection, "settings"));
+        assert!(!exists(&connection, "themes"));
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            6
+        );
     }
 
     #[test]
@@ -301,6 +369,42 @@ mod tests {
         drop(connection);
         ClaudeEnvStore::new(&db).initialize().unwrap();
         assert!(!config.exists());
+    }
+
+    #[test]
+    fn legacy_export_is_reused_after_sql_rollback() {
+        let temp = tempdir().unwrap();
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(SETTINGS_SCHEMA).unwrap();
+        connection.execute_batch(
+            "PRAGMA user_version=1;
+             CREATE TABLE claude_project_settings(project_path TEXT PRIMARY KEY, settings_json TEXT NOT NULL);
+             INSERT INTO claude_project_settings VALUES('/repo','{}');
+             INSERT INTO settings (key,value) VALUES('active_profile_name','work');
+             CREATE TRIGGER block_cleanup BEFORE DELETE ON settings
+             BEGIN SELECT RAISE(ABORT, 'cleanup blocked'); END;",
+        ).unwrap();
+        let error = initialize_schema(&mut connection, temp.path()).unwrap_err();
+        assert!(error.to_string().contains("cleanup blocked"));
+        assert!(exists(&connection, "claude_project_settings"));
+        let dumps = || {
+            fs::read_dir(temp.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>()
+        };
+        let first = dumps();
+        assert_eq!(first.len(), 1);
+        let contents = fs::read(&first[0]).unwrap();
+
+        connection
+            .execute_batch("DROP TRIGGER block_cleanup")
+            .unwrap();
+        initialize_schema(&mut connection, temp.path()).unwrap();
+
+        assert_eq!(dumps(), first);
+        assert_eq!(fs::read(&first[0]).unwrap(), contents);
+        assert!(!exists(&connection, "claude_project_settings"));
     }
 
     #[test]
