@@ -3,6 +3,7 @@ pub mod domain;
 pub(crate) mod encoding;
 pub mod features;
 pub mod infrastructure;
+pub mod pi;
 pub mod pricing;
 pub mod theme;
 

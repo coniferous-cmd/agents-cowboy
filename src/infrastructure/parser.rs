@@ -124,6 +124,7 @@ pub(super) fn parse_session_file(
         usage,
         model,
         estimated_cost,
+        reported_cost: None,
         capabilities: SessionCapabilities {
             resume: true,
             rename: true,

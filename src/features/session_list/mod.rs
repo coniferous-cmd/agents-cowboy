@@ -26,17 +26,27 @@ pub fn filter_project_sessions_for_agent<'a>(
         .collect()
 }
 
-/// Title of the sessions pane. `agent_label` is the active agent filter, or
-/// `None` when every agent is shown; the search query, if any, follows it.
-pub fn sessions_panel_title(agent_label: Option<&str>, query: &str) -> String {
-    let mut title = match agent_label {
-        Some(label) => format!("Sessions · {label}"),
-        None => "Sessions".to_string(),
-    };
-    if !query.is_empty() {
-        title.push_str(&format!(" / {query}"));
+/// Scope loaded projects to one agent: keep only that agent's sessions and
+/// drop directories left without any. The synthetic `Open Here` row is added
+/// by the UI and is never part of this list, so it survives every agent.
+pub fn projects_for_agent(mut projects: Vec<Project>, agent_id: &AgentId) -> Vec<Project> {
+    for project in &mut projects {
+        project
+            .sessions
+            .retain(|session| session.key.agent_id == *agent_id);
     }
-    title
+    projects.retain(|project| !project.sessions.is_empty());
+    projects
+}
+
+/// Title of the sessions pane. The agent tab strip is the single source of
+/// truth for the active agent, so the title carries only the search query.
+pub fn sessions_panel_title(query: &str) -> String {
+    if query.is_empty() {
+        "Sessions".to_string()
+    } else {
+        format!("Sessions / {query}")
+    }
 }
 
 #[cfg(test)]
@@ -46,29 +56,64 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn panel_title_is_plain_sessions_without_filter_or_query() {
-        assert_eq!(sessions_panel_title(None, ""), "Sessions");
+    fn panel_title_is_plain_sessions_without_a_query() {
+        assert_eq!(sessions_panel_title(""), "Sessions");
     }
 
     #[test]
-    fn panel_title_shows_the_agent_filter_when_not_searching() {
-        assert_eq!(
-            sessions_panel_title(Some("Claude"), ""),
-            "Sessions · Claude"
-        );
+    fn panel_title_shows_the_query() {
+        assert_eq!(sessions_panel_title("fix"), "Sessions / fix");
     }
 
     #[test]
-    fn panel_title_shows_the_query_without_an_agent_filter() {
-        assert_eq!(sessions_panel_title(None, "fix"), "Sessions / fix");
-    }
+    fn projects_for_agent_scopes_sessions_and_drops_empty_projects() {
+        use super::projects_for_agent;
+        use crate::domain::AgentId;
 
-    #[test]
-    fn panel_title_shows_the_agent_filter_and_query_when_searching() {
-        assert_eq!(
-            sessions_panel_title(Some("Claude"), "fix"),
-            "Sessions · Claude / fix"
-        );
+        let claude = AgentId::new("claude").unwrap();
+        let codex = AgentId::new("codex").unwrap();
+        let make_session = |key: SessionKey, cwd: &str| Session {
+            key,
+            title: "t".into(),
+            cwd: PathBuf::from(cwd),
+            git_branch: None,
+            created_at: None,
+            updated_at: None,
+            source_location: None,
+            message_count: None,
+            usage: None,
+            model: None,
+            estimated_cost: None,
+            reported_cost: None,
+            capabilities: SessionCapabilities::default(),
+        };
+        let projects = vec![
+            Project {
+                cwd: PathBuf::from("/work/mixed"),
+                sessions: vec![
+                    make_session(SessionKey::claude("c1"), "/work/mixed"),
+                    make_session(SessionKey::new(codex.clone(), "x1").unwrap(), "/work/mixed"),
+                ],
+            },
+            Project {
+                cwd: PathBuf::from("/work/codex-only"),
+                sessions: vec![make_session(
+                    SessionKey::new(codex, "x2").unwrap(),
+                    "/work/codex-only",
+                )],
+            },
+            Project {
+                cwd: PathBuf::from("/work/empty"),
+                sessions: vec![],
+            },
+        ];
+
+        let scoped = projects_for_agent(projects, &claude);
+
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].cwd, PathBuf::from("/work/mixed"));
+        assert_eq!(scoped[0].sessions.len(), 1);
+        assert_eq!(scoped[0].sessions[0].native_id(), "c1");
     }
 
     #[test]
@@ -88,6 +133,7 @@ mod tests {
                     usage: None,
                     model: None,
                     estimated_cost: None,
+                    reported_cost: None,
                     capabilities: SessionCapabilities::default(),
                 },
                 Session {
@@ -102,6 +148,7 @@ mod tests {
                     usage: None,
                     model: None,
                     estimated_cost: None,
+                    reported_cost: None,
                     capabilities: SessionCapabilities::default(),
                 },
             ],

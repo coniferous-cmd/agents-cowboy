@@ -6,6 +6,8 @@ criteria and should be implemented with TDD.
 
 ## Completed Foundations
 
+- [x] Register Claude and Pi as independent session backends, with agent-scoped browsing and mutations.
+
 - [x] Discover projects and sessions from `~/.claude/projects/`.
 - [x] Provide the two-column keyboard-first TUI.
 - [x] Resume, create, rename, search, inspect, and delete sessions.

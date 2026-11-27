@@ -6,16 +6,14 @@ use super::state::{
     build_session_info, session_resume_target, DeleteTarget, FocusPane, ModalState,
 };
 use super::Stetson;
-use crate::application::{
-    project_name_owned, session_key, session_title, ResumeLauncher, SessionRepository,
-};
+use crate::application::{project_name_owned, session_key, session_title};
 
-impl<R: SessionRepository, L: ResumeLauncher> Stetson<R, L> {
+impl Stetson {
     pub fn filtered_sessions(&self) -> Vec<&Session> {
         filter_project_sessions_for_agent(
             self.current_project(),
             &self.state.search_query,
-            self.state.agent_filter.agent_id(),
+            self.state.selected_agent_id(),
         )
     }
 

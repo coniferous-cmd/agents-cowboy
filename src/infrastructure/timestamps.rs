@@ -29,13 +29,13 @@ pub(super) fn collect_timestamps<'a>(value: &'a Value, candidate_keys: &[&str]) 
 }
 
 /// Tracks the minimum and maximum valid RFC 3339 timestamps across records.
-pub(super) struct TimestampRange {
+pub(crate) struct TimestampRange {
     earliest: Option<DateTime<FixedOffset>>,
     latest: Option<DateTime<FixedOffset>>,
 }
 
 impl TimestampRange {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             earliest: None,
             latest: None,
@@ -43,7 +43,7 @@ impl TimestampRange {
     }
 
     /// Parse `ts_str` as RFC 3339 and update the tracked range.
-    pub(super) fn consider(&mut self, ts_str: &str) {
+    pub(crate) fn consider(&mut self, ts_str: &str) {
         if let Ok(dt) = DateTime::parse_from_rfc3339(ts_str) {
             match self.earliest {
                 Some(ref earliest) if dt < *earliest => self.earliest = Some(dt),
@@ -59,7 +59,7 @@ impl TimestampRange {
     }
 
     /// Returns the earliest timestamp as a UTC RFC 3339 string, or `None`.
-    pub(super) fn created_at_string(&self) -> Option<String> {
+    pub(crate) fn created_at_string(&self) -> Option<String> {
         self.earliest.map(|dt| {
             dt.with_timezone(&Utc)
                 .format("%Y-%m-%dT%H:%M:%SZ")
@@ -68,7 +68,7 @@ impl TimestampRange {
     }
 
     /// Returns the latest timestamp as a UTC RFC 3339 string, or `None`.
-    pub(super) fn updated_at_string(&self) -> Option<String> {
+    pub(crate) fn updated_at_string(&self) -> Option<String> {
         self.latest.map(|dt| {
             dt.with_timezone(&Utc)
                 .format("%Y-%m-%dT%H:%M:%SZ")

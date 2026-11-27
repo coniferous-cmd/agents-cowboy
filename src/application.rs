@@ -20,31 +20,90 @@ pub trait SessionRepository {
     fn delete_project(&self, project_cwd: &Path) -> AppResult<()>;
 }
 
+impl<R: SessionRepository + ?Sized> SessionRepository for std::sync::Arc<R> {
+    fn load_projects(&self) -> AppResult<Vec<Project>> {
+        self.as_ref().load_projects()
+    }
+    fn rename_session(&self, key: &SessionKey, title: &str) -> AppResult<()> {
+        self.as_ref().rename_session(key, title)
+    }
+    fn delete_session(&self, key: &SessionKey) -> AppResult<()> {
+        self.as_ref().delete_session(key)
+    }
+    fn delete_project(&self, cwd: &Path) -> AppResult<()> {
+        self.as_ref().delete_project(cwd)
+    }
+}
+
 pub trait ResumeLauncher {
     fn resume(&self, target: &ResumeTarget) -> AppResult<()>;
     fn launch_new(&self, cwd: &Path) -> AppResult<()>;
 }
 
-pub struct StetsonApplication<R, L> {
-    repository: R,
-    _launcher: L,
+/// One supported agent backend = one strategy = one tab.
+///
+/// The registry of implementors drives the agent tab strip: a tab exists
+/// exactly when its strategy is registered. Implementations own their
+/// session-directory discovery, transcript parsing and usage extraction,
+/// launch/resume arguments, and rename/delete file operations; token
+/// summation, formatting, and cost estimation stay shared domain logic.
+pub trait AgentBackend: SessionRepository + ResumeLauncher {
+    fn id(&self) -> cowboy::domain::AgentId;
+    fn label(&self) -> &str;
 }
 
-impl<R: SessionRepository, L: ResumeLauncher> StetsonApplication<R, L> {
-    pub fn new(repository: R, launcher: L) -> Self {
+/// The Claude strategy: composes the existing store and launcher so the
+/// refactor stays a thin reorganization of proven behavior.
+#[derive(Clone)]
+pub struct ClaudeBackend {
+    repository: ClaudeProjectsStore,
+    launcher: ClaudeCliLauncher,
+}
+
+impl ClaudeBackend {
+    pub fn new(repository: ClaudeProjectsStore, launcher: ClaudeCliLauncher) -> Self {
         Self {
             repository,
-            _launcher: launcher,
+            launcher,
         }
     }
+}
 
-    pub fn load_projects(&self) -> AppResult<Vec<Project>> {
-        self.repository.load_projects()
+impl SessionRepository for ClaudeBackend {
+    fn load_projects(&self) -> AppResult<Vec<Project>> {
+        SessionRepository::load_projects(&self.repository)
     }
 
-    pub fn rename_session(&self, key: &SessionKey, new_title: &str) -> AppResult<Vec<Project>> {
-        self.repository.rename_session(key, new_title)?;
-        self.load_projects()
+    fn rename_session(&self, key: &SessionKey, new_title: &str) -> AppResult<()> {
+        SessionRepository::rename_session(&self.repository, key, new_title)
+    }
+
+    fn delete_session(&self, key: &SessionKey) -> AppResult<()> {
+        SessionRepository::delete_session(&self.repository, key)
+    }
+
+    fn delete_project(&self, project_cwd: &Path) -> AppResult<()> {
+        SessionRepository::delete_project(&self.repository, project_cwd)
+    }
+}
+
+impl ResumeLauncher for ClaudeBackend {
+    fn resume(&self, target: &ResumeTarget) -> AppResult<()> {
+        self.launcher.resume(target)
+    }
+
+    fn launch_new(&self, cwd: &Path) -> AppResult<()> {
+        self.launcher.launch_new(cwd)
+    }
+}
+
+impl AgentBackend for ClaudeBackend {
+    fn id(&self) -> cowboy::domain::AgentId {
+        cowboy::domain::AgentId::new("claude").expect("built-in agent id is valid")
+    }
+
+    fn label(&self) -> &str {
+        "Claude"
     }
 }
 
@@ -84,6 +143,76 @@ impl ResumeLauncher for ClaudeCliLauncher {
 
     fn launch_new(&self, cwd: &Path) -> AppResult<()> {
         self.launch(cwd, &[])
+    }
+}
+
+#[derive(Clone)]
+pub struct PiBackend {
+    repository: cowboy::pi::PiProjectsStore,
+    launcher: PiCliLauncher,
+}
+impl PiBackend {
+    pub fn new(repository: cowboy::pi::PiProjectsStore) -> Self {
+        Self {
+            repository,
+            launcher: PiCliLauncher,
+        }
+    }
+}
+impl SessionRepository for PiBackend {
+    fn load_projects(&self) -> AppResult<Vec<Project>> {
+        self.repository.load_projects().map_err(|e| e.to_string())
+    }
+    fn rename_session(&self, key: &SessionKey, title: &str) -> AppResult<()> {
+        self.repository
+            .rename_session(key, title)
+            .map_err(|e| e.to_string())
+    }
+    fn delete_session(&self, key: &SessionKey) -> AppResult<()> {
+        self.repository
+            .delete_session(key)
+            .map_err(|e| e.to_string())
+    }
+    fn delete_project(&self, cwd: &Path) -> AppResult<()> {
+        self.repository
+            .delete_project(cwd)
+            .map_err(|e| e.to_string())
+    }
+}
+#[derive(Clone)]
+pub struct PiCliLauncher;
+impl PiCliLauncher {
+    fn command(cwd: &Path, args: &[&str]) -> Command {
+        let mut cmd = Command::new("pi");
+        cmd.current_dir(cwd).args(args);
+        cmd
+    }
+    fn launch(&self, cwd: &Path, args: &[&str]) -> AppResult<()> {
+        let status = Self::command(cwd, args)
+            .status()
+            .map_err(|e| format!("Failed to launch Pi: {e}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("Pi exited with status {status}"))
+        }
+    }
+}
+impl ResumeLauncher for PiBackend {
+    fn resume(&self, t: &ResumeTarget) -> AppResult<()> {
+        self.launcher
+            .launch(&t.cwd, &["--session", &t.key.native_id])
+    }
+    fn launch_new(&self, cwd: &Path) -> AppResult<()> {
+        self.launcher.launch(cwd, &[])
+    }
+}
+impl AgentBackend for PiBackend {
+    fn id(&self) -> cowboy::domain::AgentId {
+        cowboy::domain::AgentId::new("pi").unwrap()
+    }
+    fn label(&self) -> &str {
+        "Pi"
     }
 }
 
@@ -144,5 +273,81 @@ impl SessionRepository for ClaudeProjectsStore {
     fn delete_project(&self, project_cwd: &Path) -> AppResult<()> {
         let project_path = PathBuf::from(project_cwd);
         ClaudeProjectsStore::delete_project(self, &project_path).map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod backend_tests {
+    use super::{AgentBackend, ClaudeBackend, ClaudeCliLauncher, SessionRepository};
+    use cowboy::claude_env::ClaudeEnvStore;
+    use cowboy::domain::SessionKey;
+    use cowboy::infrastructure::ClaudeProjectsStore;
+    use std::fs;
+    use std::path::Path;
+
+    fn backend_with_projects_root(root: &Path) -> ClaudeBackend {
+        ClaudeBackend::new(
+            ClaudeProjectsStore::new(root.join("projects")),
+            ClaudeCliLauncher::new(ClaudeEnvStore::new(root.join("cowboy.db"))),
+        )
+    }
+
+    fn write_session_fixture(projects_root: &Path) {
+        let project_dir = projects_root.join("-tmp-demo-repo");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("session-1.jsonl"),
+            [
+                r#"{"type":"meta","sessionId":"session-1","cwd":"/tmp/demo/repo","timestamp":"2025-07-05T08:00:00Z"}"#,
+                r#"{"type":"agent-name","agentName":"Original Title"}"#,
+                r#"{"role":"user","message":{"content":"hello"}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn claude_backend_reports_id_and_label() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = backend_with_projects_root(temp.path());
+
+        assert_eq!(backend.id().as_str(), "claude");
+        assert_eq!(backend.label(), "Claude");
+    }
+
+    #[test]
+    fn claude_backend_load_projects_delegates_to_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects_root = temp.path().join("projects");
+        write_session_fixture(&projects_root);
+        let backend = backend_with_projects_root(temp.path());
+
+        let via_backend = SessionRepository::load_projects(&backend).unwrap();
+        let via_store = ClaudeProjectsStore::new(&projects_root)
+            .load_projects()
+            .unwrap();
+
+        assert_eq!(via_backend, via_store);
+        assert_eq!(via_backend.len(), 1);
+        assert_eq!(via_backend[0].sessions.len(), 1);
+        assert_eq!(via_backend[0].sessions[0].key.agent_id.as_str(), "claude");
+    }
+
+    #[test]
+    fn claude_backend_rename_and_delete_delegate_to_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects_root = temp.path().join("projects");
+        write_session_fixture(&projects_root);
+        let backend = backend_with_projects_root(temp.path());
+        let key = SessionKey::claude("session-1");
+
+        backend.rename_session(&key, "Renamed Title").unwrap();
+        let projects = SessionRepository::load_projects(&backend).unwrap();
+        assert_eq!(projects[0].sessions[0].title, "Renamed Title");
+
+        backend.delete_session(&key).unwrap();
+        let projects = SessionRepository::load_projects(&backend).unwrap();
+        assert!(projects.is_empty() || projects[0].sessions.is_empty());
     }
 }

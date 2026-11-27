@@ -123,6 +123,7 @@ mod tests {
             usage,
             model: None,
             estimated_cost: None,
+            reported_cost: None,
             capabilities: SessionCapabilities::default(),
         }
     }

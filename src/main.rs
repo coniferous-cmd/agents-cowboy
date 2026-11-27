@@ -18,7 +18,7 @@ use cowboy::{
 
 use crate::{
     app::{DeleteCompletion, DeleteOutcome, DeleteTarget, InitialLoadCompletion, Stetson},
-    application::{ClaudeCliLauncher, ResumeLauncher, SessionRepository, StetsonApplication},
+    application::{AgentBackend, ClaudeBackend, ClaudeCliLauncher, PiBackend, SessionRepository},
 };
 
 fn main() {
@@ -61,31 +61,37 @@ fn initialize_env_store(
     Ok(env_store)
 }
 
+type WorkerBackend = std::sync::Arc<dyn AgentBackend + Send + Sync>;
+fn registered_backends(claude: ClaudeBackend, pi: PiBackend) -> (Stetson, Vec<WorkerBackend>) {
+    let workers: Vec<WorkerBackend> = vec![
+        std::sync::Arc::new(claude.clone()),
+        std::sync::Arc::new(pi.clone()),
+    ];
+    (Stetson::new(vec![Box::new(claude), Box::new(pi)]), workers)
+}
+
 fn run_tui_app(env_store: ClaudeEnvStore) -> std::result::Result<(), Box<dyn Error>> {
     let projects_root = env_store
         .claude_projects_dir()
         .map_err(|error| format!("Failed to resolve Claude projects directory: {error}"))?;
     let repository = ClaudeProjectsStore::new(projects_root);
-    let worker_repository = repository.clone();
     let launcher = ClaudeCliLauncher::new(env_store.clone());
-    let application = StetsonApplication::new(repository, launcher.clone());
-    let mut app = Stetson::new(application);
+    // Ordered agent-strategy registry: one registered strategy = one tab.
+    let pi = cowboy::pi::PiProjectsStore::from_home()
+        .map_err(|e| format!("Failed to resolve Pi sessions directory: {e}"))?;
+    let (mut app, worker_backends) =
+        registered_backends(ClaudeBackend::new(repository, launcher), PiBackend::new(pi));
 
     if let Ok(Some(theme)) = env_store.active_theme() {
         app.set_theme(ThemePalette::from(&theme));
     }
 
     let (initial_load_tx, initial_load_rx) = mpsc::channel::<InitialLoadCompletion>();
-    spawn_initial_load_worker(worker_repository.clone(), initial_load_tx);
+    spawn_initial_load_worker(worker_backends[0].clone(), initial_load_tx);
 
     loop {
         let mut terminal = enter_tui()?;
-        let tui_result = run_tui(
-            &mut terminal,
-            &mut app,
-            &worker_repository,
-            &initial_load_rx,
-        );
+        let tui_result = run_tui(&mut terminal, &mut app, &worker_backends, &initial_load_rx);
         let restore_result = leave_tui(&mut terminal);
 
         match (tui_result, restore_result) {
@@ -96,7 +102,7 @@ fn run_tui_app(env_store: ClaudeEnvStore) -> std::result::Result<(), Box<dyn Err
 
         let Some(target) = app.take_pending_resume() else {
             if let Some(cwd) = app.take_pending_new_session() {
-                match launcher.launch_new(&cwd) {
+                match app.selected_backend().launch_new(&cwd) {
                     Ok(()) => {
                         app.resume_finished(format!(
                             "Session exited, launched from {}",
@@ -112,9 +118,13 @@ fn run_tui_app(env_store: ClaudeEnvStore) -> std::result::Result<(), Box<dyn Err
             break;
         };
 
-        match launcher.resume(&target) {
+        match app.selected_backend().resume(&target) {
             Ok(()) => {
-                app.resume_finished(format!("Claude exited: {}", target.key.native_id));
+                app.resume_finished(format!(
+                    "{} exited: {}",
+                    app.selected_backend().label(),
+                    target.key.native_id
+                ));
             }
             Err(error) => {
                 app.resume_finished(format!(
@@ -137,16 +147,12 @@ fn enter_tui() -> std::result::Result<Terminal<CrosstermBackend<io::Stdout>>, Bo
     Ok(Terminal::new(backend)?)
 }
 
-fn run_tui<R, L>(
+fn run_tui(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &mut Stetson<R, L>,
-    worker_repository: &ClaudeProjectsStore,
+    app: &mut Stetson,
+    worker_backends: &[WorkerBackend],
     initial_load_rx: &mpsc::Receiver<InitialLoadCompletion>,
-) -> std::result::Result<(), Box<dyn Error>>
-where
-    R: crate::application::SessionRepository,
-    L: ResumeLauncher,
-{
+) -> std::result::Result<(), Box<dyn Error>> {
     let (delete_tx, delete_rx) = mpsc::channel::<DeleteCompletion>();
 
     loop {
@@ -162,7 +168,7 @@ where
         // Start a confirmed deletion on a worker thread (at most one at a time;
         // `take_pending_delete` yields each queued task exactly once).
         if let Some(target) = app.take_pending_delete() {
-            spawn_delete_worker(worker_repository.clone(), delete_tx.clone(), target);
+            spawn_delete_worker(worker_backends.to_vec(), delete_tx.clone(), target);
         }
 
         terminal.draw(|frame| ui::render(frame, app.state()))?;
@@ -210,7 +216,7 @@ where
 /// back through `sender`. If the thread cannot be spawned, an error completion
 /// is fed immediately so the app never stays locked.
 fn spawn_delete_worker(
-    repository: ClaudeProjectsStore,
+    workers: Vec<WorkerBackend>,
     sender: mpsc::Sender<DeleteCompletion>,
     target: DeleteTarget,
 ) {
@@ -220,7 +226,12 @@ fn spawn_delete_worker(
     let spawn_result = thread::Builder::new()
         .name("cowboy-delete".to_string())
         .spawn(move || {
-            let outcome = run_delete(&repository, &target);
+            let outcome = match workers.iter().find(|b| &b.id() == target.agent_id()) {
+                Some(repository) => run_delete(repository, &target),
+                None => {
+                    DeleteOutcome::Failure(format!("Unregistered agent: {}", target.agent_id()))
+                }
+            };
             let _ = sender.send(DeleteCompletion { target, outcome });
         });
 
@@ -232,7 +243,7 @@ fn spawn_delete_worker(
     }
 }
 
-fn run_delete(repository: &ClaudeProjectsStore, target: &DeleteTarget) -> DeleteOutcome {
+fn run_delete(repository: &dyn SessionRepository, target: &DeleteTarget) -> DeleteOutcome {
     let result = match target {
         DeleteTarget::Project { cwd, .. } => SessionRepository::delete_project(repository, cwd),
         DeleteTarget::Session { key, .. } => SessionRepository::delete_session(repository, key),
@@ -266,6 +277,123 @@ mod startup_tests {
     use std::path::Path;
     use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
     use std::time::Duration;
+
+    #[test]
+    fn startup_registration_and_deletion_route_by_agent() {
+        use cowboy::domain::AgentId;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let claude = ClaudeBackend::new(
+            ClaudeProjectsStore::new(root.join("claude")),
+            ClaudeCliLauncher::new(ClaudeEnvStore::new(root.join("db"))),
+        );
+        let dir = root.join("pi/bucket");
+        std::fs::create_dir_all(&dir).unwrap();
+        for id in ["keep", "delete"] {
+            std::fs::write(
+                dir.join(format!("{id}.jsonl")),
+                serde_json::json!({"type":"session","version":3,"id":id,"cwd":"pi-only"})
+                    .to_string(),
+            )
+            .unwrap();
+        }
+        let (app, workers) = registered_backends(
+            claude,
+            PiBackend::new(cowboy::pi::PiProjectsStore::new(root.join("pi"))),
+        );
+        assert_eq!(
+            app.state()
+                .agent_tabs
+                .iter()
+                .map(|t| t.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Claude", "Pi"]
+        );
+        for agent in ["unknown", "pi"] {
+            let (tx, rx) = mpsc::channel();
+            spawn_delete_worker(
+                workers.clone(),
+                tx,
+                DeleteTarget::Session {
+                    title: "target".into(),
+                    key: SessionKey::new(AgentId::new(agent).unwrap(), "delete").unwrap(),
+                },
+            );
+            let o = rx.recv_timeout(Duration::from_secs(5)).unwrap().outcome;
+            match o {
+                DeleteOutcome::Failure(e) => {
+                    assert_eq!(agent, "unknown");
+                    assert!(e.contains("unknown"));
+                    assert!(dir.join("delete.jsonl").exists());
+                }
+                DeleteOutcome::Success(p) => {
+                    assert_eq!(agent, "pi");
+                    assert_eq!(p.len(), 1);
+                    assert_eq!(p[0].sessions.len(), 1);
+                    assert_eq!(p[0].sessions[0].native_id(), "keep");
+                    assert!(!dir.join("delete.jsonl").exists());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn worker_calls_only_the_matching_backend_for_delete_and_reload() {
+        use crate::application::{AppResult, ResumeLauncher};
+        use cowboy::domain::AgentId;
+        use std::sync::{Arc, Mutex};
+        struct Probe(&'static str, Mutex<Vec<&'static str>>);
+        impl AgentBackend for Probe {
+            fn id(&self) -> AgentId {
+                AgentId::new(self.0).unwrap()
+            }
+            fn label(&self) -> &str {
+                self.0
+            }
+        }
+        impl ResumeLauncher for Probe {
+            fn resume(&self, _: &app::ResumeTarget) -> AppResult<()> {
+                unreachable!()
+            }
+            fn launch_new(&self, _: &Path) -> AppResult<()> {
+                unreachable!()
+            }
+        }
+        impl SessionRepository for Probe {
+            fn load_projects(&self) -> AppResult<Vec<Project>> {
+                self.1.lock().unwrap().push("load");
+                Ok(vec![])
+            }
+            fn delete_project(&self, _: &Path) -> AppResult<()> {
+                self.1.lock().unwrap().push("delete");
+                Ok(())
+            }
+            fn rename_session(&self, _: &SessionKey, _: &str) -> AppResult<()> {
+                unreachable!()
+            }
+            fn delete_session(&self, _: &SessionKey) -> AppResult<()> {
+                unreachable!()
+            }
+        }
+        let claude = Arc::new(Probe("claude", Mutex::default()));
+        let pi = Arc::new(Probe("pi", Mutex::default()));
+        let (tx, rx) = mpsc::channel();
+        spawn_delete_worker(
+            vec![claude.clone(), pi.clone()],
+            tx,
+            DeleteTarget::Project {
+                agent_id: pi.id(),
+                name: "p".into(),
+                cwd: "p".into(),
+            },
+        );
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap().outcome,
+            DeleteOutcome::Success(_)
+        ));
+        assert!(claude.1.lock().unwrap().is_empty());
+        assert_eq!(*pi.1.lock().unwrap(), ["delete", "load"]);
+    }
 
     struct BlockingRepository {
         started: SyncSender<()>,

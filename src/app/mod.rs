@@ -17,46 +17,12 @@ mod state {
         Sessions,
     }
 
-    /// Limits the sessions shown in the session pane to one agent backend.
-    #[derive(Debug, Clone, PartialEq, Eq, Default)]
-    pub enum AgentFilter {
-        #[default]
-        All,
-        Agent(AgentId),
-    }
-
-    impl AgentFilter {
-        pub fn label(&self) -> &str {
-            match self {
-                Self::All => "All",
-                Self::Agent(agent_id) => match agent_id.as_str() {
-                    "claude" => "Claude",
-                    "codex" => "Codex",
-                    value => value,
-                },
-            }
-        }
-
-        pub fn agent_id(&self) -> Option<&AgentId> {
-            match self {
-                Self::All => None,
-                Self::Agent(agent_id) => Some(agent_id),
-            }
-        }
-    }
-
-    pub fn agent_filters(projects: &[cowboy::domain::Project]) -> Vec<AgentFilter> {
-        let mut agent_ids: Vec<_> = projects
-            .iter()
-            .flat_map(|project| project.sessions.iter())
-            .map(|session| session.key.agent_id.clone())
-            .collect();
-        agent_ids.sort();
-        agent_ids.dedup();
-
-        std::iter::once(AgentFilter::All)
-            .chain(agent_ids.into_iter().map(AgentFilter::Agent))
-            .collect()
+    /// One tab in the agent strip: a registered backend strategy. Exactly one
+    /// tab is always selected; there is no `All` variant.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct AgentTab {
+        pub id: AgentId,
+        pub label: String,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +75,12 @@ mod state {
     }
 
     impl DeleteTarget {
+        pub fn agent_id(&self) -> &AgentId {
+            match self {
+                Self::Project { agent_id, .. } => agent_id,
+                Self::Session { key, .. } => &key.agent_id,
+            }
+        }
         /// Internal kind tag — not exposed outside this module.
         pub(crate) fn kind(&self) -> Kind {
             match self {
@@ -182,6 +154,7 @@ mod state {
         pub usage: Option<cowboy::domain::SessionUsage>,
         pub model: Option<String>,
         pub estimated_cost: Option<cowboy::domain::CostEstimate>,
+        pub reported_cost: Option<cowboy::domain::ReportedCost>,
     }
 
     pub fn build_session_info(
@@ -201,6 +174,7 @@ mod state {
             usage: session.usage.clone(),
             model: session.model.clone(),
             estimated_cost: session.estimated_cost.clone(),
+            reported_cost: session.reported_cost,
         }
     }
 
@@ -223,7 +197,11 @@ mod state {
 
     pub struct AppState {
         pub projects: Vec<cowboy::domain::Project>,
-        pub agent_filter: AgentFilter,
+        pub agent_tabs: Vec<AgentTab>,
+        pub selected_agent: usize,
+        /// Per-agent project caches, parallel to the registry. `None` means
+        /// the agent has not been visited yet (lazy loading).
+        pub project_cache: Vec<Option<Vec<cowboy::domain::Project>>>,
         pub selected_project: usize,
         pub selected_session: usize,
         pub focus: FocusPane,
@@ -246,7 +224,9 @@ mod state {
         fn default() -> Self {
             Self {
                 projects: Vec::new(),
-                agent_filter: AgentFilter::All,
+                agent_tabs: Vec::new(),
+                selected_agent: 0,
+                project_cache: Vec::new(),
                 selected_project: 0,
                 selected_session: 0,
                 focus: FocusPane::Projects,
@@ -264,6 +244,14 @@ mod state {
                 toast: None,
                 theme: ThemePalette::default(),
             }
+        }
+    }
+
+    impl AppState {
+        /// The selected tab's agent id, or `None` when no tabs are registered
+        /// (default-constructed state used in rendering tests).
+        pub fn selected_agent_id(&self) -> Option<&AgentId> {
+            self.agent_tabs.get(self.selected_agent).map(|tab| &tab.id)
         }
     }
 
@@ -286,6 +274,7 @@ mod state {
                 usage,
                 model: Some("claude-sonnet-5".to_string()),
                 estimated_cost: None,
+                reported_cost: None,
                 capabilities: SessionCapabilities::default(),
             }
         }
@@ -316,6 +305,19 @@ mod state {
             assert_eq!(u.cache_creation_tokens, 300);
             assert_eq!(u.cache_read_tokens, 400);
             assert_eq!(u.total_tokens(), 1000);
+        }
+
+        #[test]
+        fn reported_cost_passes_through_without_an_estimate() {
+            let mut session = make_session(None);
+            let cost = cowboy::domain::ReportedCost {
+                total: 0.25,
+                from_provider: true,
+            };
+            session.reported_cost = Some(cost);
+            let info = build_session_info(&make_project(), &session);
+            assert_eq!(info.reported_cost, Some(cost));
+            assert!(info.estimated_cost.is_none());
         }
 
         #[test]
@@ -388,19 +390,13 @@ mod state {
 // ── Internal module: navigation ──────────────────────────────────────────────
 
 mod navigation {
-    use crate::application::{
-        project_name_owned, project_working_dir, session_key, session_title, ResumeLauncher,
-        SessionRepository,
-    };
+    use crate::application::{project_name_owned, project_working_dir, session_key, session_title};
+    use cowboy::features::session_list::projects_for_agent;
 
-    use super::state::{agent_filters, AgentFilter, FocusPane, OPEN_HERE_PROJECT_LABEL};
+    use super::state::{FocusPane, OPEN_HERE_PROJECT_LABEL};
     use super::Stetson;
 
-    impl<R, L> Stetson<R, L>
-    where
-        R: SessionRepository,
-        L: ResumeLauncher,
-    {
+    impl Stetson {
         pub fn toggle_focus(&mut self) {
             self.state.focus = match self.state.focus {
                 FocusPane::Projects => FocusPane::Sessions,
@@ -412,19 +408,47 @@ mod navigation {
             };
         }
 
-        pub fn cycle_agent_filter(&mut self) {
-            let filters = agent_filters(&self.state.projects);
-            let current = filters
-                .iter()
-                .position(|filter| filter == &self.state.agent_filter)
-                .unwrap_or(0);
-            self.state.agent_filter = filters
-                .get(current + 1)
-                .cloned()
-                .unwrap_or(AgentFilter::All);
+        /// Cycle the agent tab selection in registration order, wrapping to
+        /// the first. With a single registered agent this is a no-op that
+        /// still reports the active agent.
+        pub fn cycle_agent_tab(&mut self) {
+            let next = (self.state.selected_agent + 1) % self.backends.len();
+            if next == self.state.selected_agent {
+                self.state.status = format!("Agent: {}", self.state.agent_tabs[next].label);
+                return;
+            }
+            self.switch_to_agent(next);
+        }
+
+        /// Select an agent tab and show its projects. The search query is a
+        /// view filter and survives the switch; session selection resets.
+        pub fn switch_to_agent(&mut self, index: usize) {
+            if index >= self.backends.len() {
+                return;
+            }
+            let projects = if let Some(Some(cached)) = self.state.project_cache.get(index) {
+                cached.clone()
+            } else {
+                match self.backends[index].load_projects() {
+                    Ok(projects) => {
+                        let agent_id = self.backends[index].id();
+                        let projects =
+                            cowboy::features::session_list::projects_for_agent(projects, &agent_id);
+                        if let Some(slot) = self.state.project_cache.get_mut(index) {
+                            *slot = Some(projects.clone());
+                        }
+                        projects
+                    }
+                    Err(error) => {
+                        self.show_toast(error);
+                        return;
+                    }
+                }
+            };
+            self.state.selected_agent = index;
+            let status = format!("Agent: {}", self.state.agent_tabs[index].label);
+            self.replace_projects(projects, &status);
             self.state.selected_session = 0;
-            self.clamp_selections();
-            self.state.status = format!("Agent: {}", self.state.agent_filter.label());
         }
 
         pub fn move_selection(&mut self, delta: isize) {
@@ -489,7 +513,17 @@ mod navigation {
                 .map(|value| value.to_string());
             let current_session_key = self.current_session().map(session_key).cloned();
 
+            // Scope to the selected agent before anything renders or sums:
+            // directories without this agent's sessions disappear, and the
+            // remaining rows count only this agent's sessions.
+            let projects = match self.state.selected_agent_id() {
+                Some(agent_id) => projects_for_agent(projects, agent_id),
+                None => projects,
+            };
             self.state.projects = projects;
+            if let Some(slot) = self.state.project_cache.get_mut(self.state.selected_agent) {
+                *slot = Some(self.state.projects.clone());
+            }
             self.state.delete_target = None;
             self.state.selected_project = current_project_key
                 .as_deref()
@@ -540,14 +574,14 @@ mod navigation {
 // ── Internal module: modal ───────────────────────────────────────────────────
 
 mod modal {
-    use crate::application::{session_key, ResumeLauncher, SessionRepository};
+    use crate::application::session_key;
     use cowboy::domain::validate_rename_title;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::state::ModalState;
     use super::Stetson;
 
-    impl<R: SessionRepository, L: ResumeLauncher> Stetson<R, L> {
+    impl Stetson {
         pub fn handle_key(&mut self, key: KeyEvent) {
             if self.delete_in_progress() {
                 let is_quit = matches!(key.code, KeyCode::Char('q'))
@@ -578,7 +612,7 @@ mod modal {
                 }
                 KeyCode::Down => self.move_selection(1),
                 KeyCode::Up => self.move_selection(-1),
-                KeyCode::Char('a') => self.cycle_agent_filter(),
+                KeyCode::Char('a') => self.cycle_agent_tab(),
                 KeyCode::Char('/') => self.open_search(),
                 KeyCode::Char('i') => self.open_info(),
                 KeyCode::Char('r') => self.begin_rename(),
@@ -641,7 +675,11 @@ mod modal {
                         }
                     };
 
-                    match self.application.rename_session(&session_key, &new_title) {
+                    let backend = self.selected_backend();
+                    match backend
+                        .rename_session(&session_key, &new_title)
+                        .and_then(|()| backend.load_projects())
+                    {
                         Ok(projects) => {
                             self.state.modal = ModalState::None;
                             self.state.input_buffer.clear();
@@ -739,14 +777,17 @@ mod modal {
 
 // ── Public re-exports ────────────────────────────────────────────────────────
 
+#[cfg(test)]
+pub(crate) use state::build_session_info;
+
 pub use state::{
-    AgentFilter, AppState, DeleteCompletion, DeleteOutcome, DeleteTarget, FocusPane, ModalState,
+    AgentTab, AppState, DeleteCompletion, DeleteOutcome, DeleteTarget, FocusPane, ModalState,
     ResumeTarget, Toast,
 };
 
 // ── Stetson main impl ────────────────────────────────────────────────────────
 
-use crate::application::{AppResult, ResumeLauncher, SessionRepository, StetsonApplication};
+use crate::application::{AgentBackend, AppResult};
 use std::path::PathBuf;
 
 #[derive(Debug)]
@@ -754,21 +795,35 @@ pub struct InitialLoadCompletion {
     pub projects: AppResult<Vec<cowboy::domain::Project>>,
 }
 
-pub struct Stetson<R, L> {
-    application: StetsonApplication<R, L>,
+pub struct Stetson {
+    backends: Vec<Box<dyn AgentBackend>>,
     state: AppState,
 }
 
-impl<R, L> Stetson<R, L>
-where
-    R: SessionRepository,
-    L: ResumeLauncher,
-{
-    pub fn new(application: StetsonApplication<R, L>) -> Self {
-        Self {
-            application,
-            state: AppState::default(),
-        }
+impl Stetson {
+    pub fn new(backends: Vec<Box<dyn AgentBackend>>) -> Self {
+        assert!(
+            !backends.is_empty(),
+            "agent registry must contain at least one backend"
+        );
+        let mut state = AppState::default();
+        state.agent_tabs = backends
+            .iter()
+            .map(|backend| state::AgentTab {
+                id: backend.id(),
+                label: backend.label().to_string(),
+            })
+            .collect();
+        state.project_cache = vec![None; backends.len()];
+        Self { backends, state }
+    }
+
+    /// The backend of the currently selected agent tab.
+    pub fn selected_backend(&self) -> &dyn AgentBackend {
+        self.backends
+            .get(self.state.selected_agent)
+            .expect("selected agent is registered")
+            .as_ref()
     }
 
     pub fn state(&self) -> &AppState {
@@ -838,7 +893,18 @@ where
 
     pub fn complete_initial_load(&mut self, completion: InitialLoadCompletion) {
         match completion.projects {
-            Ok(projects) => self.replace_projects(projects, "Loaded ~/.claude"),
+            Ok(projects) => {
+                // The startup worker loads the first registered agent.
+                let agent_id = self.backends[0].id();
+                let projects =
+                    cowboy::features::session_list::projects_for_agent(projects, &agent_id);
+                if let Some(slot) = self.state.project_cache.get_mut(0) {
+                    *slot = Some(projects.clone());
+                }
+                if self.state.selected_agent == 0 {
+                    self.replace_projects(projects, "Loaded ~/.claude");
+                }
+            }
             Err(error) => self.show_toast(error),
         }
     }
@@ -852,7 +918,7 @@ where
         self.state.input_buffer.clear();
         self.state.delete_target = None;
 
-        match self.application.load_projects() {
+        match self.selected_backend().load_projects() {
             Ok(projects) => self.replace_projects(projects, &status.into()),
             Err(error) => self.show_toast(error),
         }
@@ -863,9 +929,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::state::{AgentFilter, DeleteTarget, FocusPane, ModalState, ResumeTarget};
+    use super::state::{DeleteTarget, FocusPane, ModalState, ResumeTarget};
     use super::{DeleteCompletion, DeleteOutcome, InitialLoadCompletion, Stetson};
-    use crate::application::{AppResult, ResumeLauncher, SessionRepository, StetsonApplication};
+    use crate::application::{AgentBackend, AppResult, ResumeLauncher, SessionRepository};
     use cowboy::domain::{Project, Session, SessionCapabilities, SessionKey};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::cell::RefCell;
@@ -897,12 +963,13 @@ mod tests {
         delete_session_calls: Rc<RefCell<Vec<String>>>,
         delete_project_calls: Rc<RefCell<Vec<PathBuf>>>,
         load_calls: Rc<RefCell<usize>>,
+        projects: Vec<Project>,
     }
 
     impl SessionRepository for SpyRepository {
         fn load_projects(&self) -> AppResult<Vec<Project>> {
             *self.load_calls.borrow_mut() += 1;
-            Ok(Vec::new())
+            Ok(self.projects.clone())
         }
         fn rename_session(&self, _session_id: &SessionKey, _new_title: &str) -> AppResult<()> {
             Ok(())
@@ -921,20 +988,29 @@ mod tests {
         }
     }
 
-    fn app_with_spy(
-        projects: Vec<Project>,
-        repository: SpyRepository,
-    ) -> Stetson<SpyRepository, FakeLauncher> {
-        let application = StetsonApplication::new(repository, FakeLauncher);
-        let mut app = Stetson::new(application);
-        app.state.projects = projects;
-        app
+    /// Test strategy: any repository plus a no-op launcher, registered under a
+    /// chosen agent id so multi-agent behavior can be exercised with fakes.
+    struct TestBackend<R> {
+        id: &'static str,
+        repository: R,
     }
 
-    #[derive(Clone)]
-    struct FakeLauncher;
+    impl<R: SessionRepository> SessionRepository for TestBackend<R> {
+        fn load_projects(&self) -> AppResult<Vec<Project>> {
+            self.repository.load_projects()
+        }
+        fn rename_session(&self, key: &SessionKey, new_title: &str) -> AppResult<()> {
+            self.repository.rename_session(key, new_title)
+        }
+        fn delete_session(&self, key: &SessionKey) -> AppResult<()> {
+            self.repository.delete_session(key)
+        }
+        fn delete_project(&self, cwd: &Path) -> AppResult<()> {
+            self.repository.delete_project(cwd)
+        }
+    }
 
-    impl ResumeLauncher for FakeLauncher {
+    impl<R: SessionRepository> ResumeLauncher for TestBackend<R> {
         fn resume(&self, _target: &ResumeTarget) -> AppResult<()> {
             Ok(())
         }
@@ -943,9 +1019,33 @@ mod tests {
         }
     }
 
-    fn app_with_projects(projects: Vec<Project>) -> Stetson<FakeRepository, FakeLauncher> {
-        let application = StetsonApplication::new(FakeRepository, FakeLauncher);
-        let mut app = Stetson::new(application);
+    impl<R: SessionRepository> AgentBackend for TestBackend<R> {
+        fn id(&self) -> cowboy::domain::AgentId {
+            cowboy::domain::AgentId::new(self.id).expect("test agent id is valid")
+        }
+        fn label(&self) -> &str {
+            match self.id {
+                "claude" => "Claude",
+                "codex" => "Codex",
+                other => other,
+            }
+        }
+    }
+
+    fn app_with_spy(projects: Vec<Project>, repository: SpyRepository) -> Stetson {
+        let mut app = Stetson::new(vec![Box::new(TestBackend {
+            id: "claude",
+            repository,
+        })]);
+        app.state.projects = projects;
+        app
+    }
+
+    fn app_with_projects(projects: Vec<Project>) -> Stetson {
+        let mut app = Stetson::new(vec![Box::new(TestBackend {
+            id: "claude",
+            repository: FakeRepository,
+        })]);
         app.state.projects = projects;
         app
     }
@@ -970,6 +1070,7 @@ mod tests {
             usage: None,
             model: None,
             estimated_cost: None,
+            reported_cost: None,
             capabilities: SessionCapabilities::default(),
         }
     }
@@ -1110,8 +1211,8 @@ mod tests {
     }
 
     #[test]
-    fn agent_filter_cycles_and_filters_sessions_in_the_current_project() {
-        let mut app = app_with_projects(vec![project(
+    fn sessions_are_scoped_to_the_selected_agent() {
+        let app = app_with_projects(vec![project(
             "/work/repo",
             vec![
                 session_for_agent("claude", "claude-1", "/work/repo"),
@@ -1119,23 +1220,385 @@ mod tests {
             ],
         )]);
 
-        app.handle_key(key_char('a'));
-        assert_eq!(
-            app.state.agent_filter,
-            AgentFilter::Agent(cowboy::domain::AgentId::new("claude").unwrap())
-        );
+        assert_eq!(app.filtered_sessions().len(), 1);
         assert_eq!(app.filtered_sessions()[0].native_id(), "claude-1");
+    }
+
+    // ── Agent tab selection ───────────────────────────────────────────────
+
+    struct StubRepository {
+        projects: Vec<Project>,
+    }
+
+    impl SessionRepository for StubRepository {
+        fn load_projects(&self) -> AppResult<Vec<Project>> {
+            Ok(self.projects.clone())
+        }
+        fn rename_session(&self, _: &SessionKey, _: &str) -> AppResult<()> {
+            Ok(())
+        }
+        fn delete_session(&self, _: &SessionKey) -> AppResult<()> {
+            Ok(())
+        }
+        fn delete_project(&self, _: &Path) -> AppResult<()> {
+            Ok(())
+        }
+    }
+
+    fn claude_and_codex_app() -> Stetson {
+        Stetson::new(vec![
+            Box::new(TestBackend {
+                id: "claude",
+                repository: StubRepository {
+                    projects: vec![project(
+                        "/work/repo",
+                        vec![session_for_agent("claude", "claude-1", "/work/repo")],
+                    )],
+                },
+            }),
+            Box::new(TestBackend {
+                id: "codex",
+                repository: StubRepository {
+                    projects: vec![project(
+                        "/work/repo",
+                        vec![session_for_agent("codex", "codex-1", "/work/repo")],
+                    )],
+                },
+            }),
+        ])
+    }
+
+    #[test]
+    fn startup_selects_the_first_registered_agent() {
+        let app = claude_and_codex_app();
+
+        assert_eq!(app.state.selected_agent, 0);
+        assert_eq!(app.state.agent_tabs.len(), 2);
+        assert_eq!(app.state.agent_tabs[0].label, "Claude");
+        assert_eq!(app.state.agent_tabs[1].label, "Codex");
+    }
+
+    #[test]
+    fn a_cycles_tabs_in_registration_order_with_wraparound() {
+        let mut app = claude_and_codex_app();
 
         app.handle_key(key_char('a'));
-        assert_eq!(
-            app.state.agent_filter,
-            AgentFilter::Agent(cowboy::domain::AgentId::new("codex").unwrap())
-        );
-        assert_eq!(app.filtered_sessions()[0].native_id(), "codex-1");
+        assert_eq!(app.state.selected_agent, 1);
+        assert_eq!(app.state.projects[0].sessions[0].native_id(), "codex-1");
 
         app.handle_key(key_char('a'));
-        assert_eq!(app.state.agent_filter, AgentFilter::All);
-        assert_eq!(app.filtered_sessions().len(), 2);
+        assert_eq!(app.state.selected_agent, 0);
+        assert_eq!(app.state.projects[0].sessions[0].native_id(), "claude-1");
+    }
+
+    #[test]
+    fn a_with_one_agent_keeps_selection_and_reports_status() {
+        let mut app = app_with_projects(vec![project(
+            "/work/repo",
+            vec![session("s1", "/work/repo")],
+        )]);
+
+        app.handle_key(key_char('a'));
+
+        assert_eq!(app.state.selected_agent, 0);
+        assert_eq!(app.state.status, "Agent: Claude");
+    }
+
+    #[test]
+    fn selection_resets_to_default_on_fresh_start() {
+        let mut app = claude_and_codex_app();
+        app.handle_key(key_char('a'));
+        assert_eq!(app.state.selected_agent, 1);
+
+        let fresh = claude_and_codex_app();
+        assert_eq!(fresh.state.selected_agent, 0);
+    }
+
+    // ── Lazy per-agent loading ────────────────────────────────────────────
+
+    fn two_spy_agents() -> (Stetson, SpyRepository, SpyRepository) {
+        let claude_spy = SpyRepository {
+            projects: vec![project(
+                "/work/repo",
+                vec![session_for_agent("claude", "claude-1", "/work/repo")],
+            )],
+            ..SpyRepository::default()
+        };
+        let codex_spy = SpyRepository {
+            projects: vec![project(
+                "/work/repo",
+                vec![session_for_agent("codex", "codex-1", "/work/repo")],
+            )],
+            ..SpyRepository::default()
+        };
+        let app = Stetson::new(vec![
+            Box::new(TestBackend {
+                id: "claude",
+                repository: claude_spy.clone(),
+            }),
+            Box::new(TestBackend {
+                id: "codex",
+                repository: codex_spy.clone(),
+            }),
+        ]);
+        (app, claude_spy, codex_spy)
+    }
+
+    #[test]
+    fn first_visit_loads_and_revisits_reuse_the_cache() {
+        let (mut app, claude_spy, codex_spy) = two_spy_agents();
+        app.complete_initial_load(InitialLoadCompletion {
+            projects: Ok(vec![project(
+                "/work/repo",
+                vec![session("s1", "/work/repo")],
+            )]),
+        });
+
+        app.handle_key(key_char('a')); // first visit to codex
+        assert_eq!(*codex_spy.load_calls.borrow(), 1);
+        assert_eq!(app.state.projects[0].sessions[0].native_id(), "codex-1");
+
+        app.handle_key(key_char('a')); // back to claude — cached
+        assert_eq!(*claude_spy.load_calls.borrow(), 0);
+        assert_eq!(app.state.projects[0].sessions[0].native_id(), "s1");
+
+        app.handle_key(key_char('a')); // codex again — cached
+        assert_eq!(*codex_spy.load_calls.borrow(), 1);
+    }
+
+    #[test]
+    fn complete_delete_updates_only_the_selected_agents_cache() {
+        let (mut app, claude_spy, _codex_spy) = two_spy_agents();
+        app.complete_initial_load(InitialLoadCompletion {
+            projects: Ok(vec![project(
+                "/work/repo",
+                vec![session("s1", "/work/repo")],
+            )]),
+        });
+        app.handle_key(key_char('a')); // select codex
+
+        app.complete_delete(DeleteCompletion {
+            target: DeleteTarget::Session {
+                title: "codex-1".to_string(),
+                key: SessionKey::new(cowboy::domain::AgentId::new("codex").unwrap(), "codex-1")
+                    .unwrap(),
+            },
+            outcome: DeleteOutcome::Success(vec![project(
+                "/new",
+                vec![session_for_agent("codex", "codex-2", "/new")],
+            )]),
+        });
+        assert_eq!(app.state.projects[0].cwd, PathBuf::from("/new"));
+
+        app.handle_key(key_char('a')); // back to claude — untouched cache
+        assert_eq!(app.state.projects[0].cwd, PathBuf::from("/work/repo"));
+        assert_eq!(app.state.projects[0].sessions[0].native_id(), "s1");
+        assert_eq!(*claude_spy.load_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn resume_finished_reloads_only_the_selected_backend() {
+        let (mut app, claude_spy, codex_spy) = two_spy_agents();
+        app.handle_key(key_char('a')); // select codex (load 1)
+
+        app.resume_finished("done");
+
+        assert_eq!(*codex_spy.load_calls.borrow(), 2);
+        assert_eq!(*claude_spy.load_calls.borrow(), 0);
+    }
+
+    // ── Project-level agent scoping ───────────────────────────────────────
+
+    #[test]
+    fn projects_column_scopes_to_selected_agent_and_drops_foreign_projects() {
+        let mut app = app_with_projects(Vec::new());
+
+        app.complete_initial_load(InitialLoadCompletion {
+            projects: Ok(vec![
+                project(
+                    "/work/mixed",
+                    vec![
+                        session_for_agent("claude", "claude-1", "/work/mixed"),
+                        session_for_agent("codex", "codex-1", "/work/mixed"),
+                    ],
+                ),
+                project(
+                    "/work/codex-only",
+                    vec![session_for_agent("codex", "codex-2", "/work/codex-only")],
+                ),
+                project("/work/empty", Vec::new()),
+            ]),
+        });
+
+        assert_eq!(app.state.projects.len(), 1);
+        assert_eq!(app.state.projects[0].cwd, PathBuf::from("/work/mixed"));
+        assert_eq!(app.state.projects[0].sessions.len(), 1);
+        assert_eq!(app.state.projects[0].sessions[0].native_id(), "claude-1");
+        assert_eq!(app.project_item_count(), 2); // mixed + Open Here
+    }
+
+    #[test]
+    fn open_here_is_present_under_an_agent_with_zero_projects() {
+        let mut app = Stetson::new(vec![
+            Box::new(TestBackend {
+                id: "claude",
+                repository: StubRepository {
+                    projects: vec![project("/work/repo", vec![session("s1", "/work/repo")])],
+                },
+            }),
+            Box::new(TestBackend {
+                id: "codex",
+                repository: StubRepository {
+                    projects: Vec::new(),
+                },
+            }),
+        ]);
+
+        app.handle_key(key_char('a')); // codex has no projects
+
+        assert!(app.state.projects.is_empty());
+        assert_eq!(app.project_item_count(), 1);
+        assert!(app.is_open_here_selected());
+    }
+
+    #[test]
+    fn project_row_summary_counts_only_selected_agent_sessions() {
+        let mut claude_session = session_for_agent("claude", "claude-1", "/work/mixed");
+        claude_session.usage = Some(cowboy::domain::SessionUsage {
+            input_tokens: 100,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+        });
+        let mut codex_session = session_for_agent("codex", "codex-1", "/work/mixed");
+        codex_session.usage = Some(cowboy::domain::SessionUsage {
+            input_tokens: 999,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+        });
+        let mut app = app_with_projects(Vec::new());
+
+        app.complete_initial_load(InitialLoadCompletion {
+            projects: Ok(vec![project(
+                "/work/mixed",
+                vec![claude_session, codex_session],
+            )]),
+        });
+
+        let summary =
+            cowboy::features::project_usage::summarize_project_usage(&app.state.projects[0]);
+        assert_eq!(summary.session_count, 1);
+        assert_eq!(summary.known_total, 100);
+    }
+
+    // ── Tab-switch continuity ─────────────────────────────────────────────
+
+    fn continuity_app(codex_projects: Vec<Project>) -> Stetson {
+        let mut app = Stetson::new(vec![
+            Box::new(TestBackend {
+                id: "claude",
+                repository: StubRepository {
+                    projects: vec![
+                        project(
+                            "/work/a",
+                            vec![session_for_agent("claude", "a1", "/work/a")],
+                        ),
+                        project(
+                            "/work/b",
+                            vec![
+                                session_for_agent("claude", "b1", "/work/b"),
+                                session_for_agent("claude", "b2", "/work/b"),
+                            ],
+                        ),
+                    ],
+                },
+            }),
+            Box::new(TestBackend {
+                id: "codex",
+                repository: StubRepository {
+                    projects: codex_projects,
+                },
+            }),
+        ]);
+        // Populate the claude list the way the startup load would, so
+        // selection indices in these tests refer to real rows.
+        app.switch_to_agent(0);
+        app
+    }
+
+    #[test]
+    fn switching_tabs_keeps_the_same_directory_selected_when_present() {
+        let mut app = continuity_app(vec![
+            project(
+                "/work/b",
+                vec![session_for_agent("codex", "bx1", "/work/b")],
+            ),
+            project("/work/c", vec![session_for_agent("codex", "c1", "/work/c")]),
+        ]);
+        app.state.selected_project = 1; // /work/b under claude
+
+        app.handle_key(key_char('a'));
+
+        assert_eq!(app.state.selected_agent, 1);
+        assert_eq!(app.current_project().unwrap().cwd, PathBuf::from("/work/b"));
+    }
+
+    #[test]
+    fn switching_tabs_falls_back_to_the_first_project_when_directory_absent() {
+        let mut app = continuity_app(vec![project(
+            "/work/c",
+            vec![session_for_agent("codex", "c1", "/work/c")],
+        )]);
+        app.state.selected_project = 1; // /work/b — absent under codex
+
+        app.handle_key(key_char('a'));
+
+        assert_eq!(app.state.selected_project, 0);
+        assert_eq!(app.current_project().unwrap().cwd, PathBuf::from("/work/c"));
+    }
+
+    #[test]
+    fn switching_to_an_empty_agent_selects_open_here() {
+        let mut app = continuity_app(Vec::new());
+        app.state.selected_project = 1;
+
+        app.handle_key(key_char('a'));
+
+        assert!(app.state.projects.is_empty());
+        assert!(app.is_open_here_selected());
+    }
+
+    #[test]
+    fn switching_tabs_resets_session_selection_to_the_first_row() {
+        let mut app = continuity_app(vec![project(
+            "/work/b",
+            vec![
+                session_for_agent("codex", "bx1", "/work/b"),
+                session_for_agent("codex", "bx2", "/work/b"),
+            ],
+        )]);
+        app.state.selected_project = 1;
+        app.state.selected_session = 1; // second claude session
+
+        app.handle_key(key_char('a'));
+
+        assert_eq!(app.state.selected_session, 0);
+        assert_eq!(app.current_session().unwrap().native_id(), "bx1");
+    }
+
+    #[test]
+    fn switching_tabs_preserves_the_search_query() {
+        let mut app = continuity_app(vec![project(
+            "/work/b",
+            vec![session_for_agent("codex", "bx1", "/work/b")],
+        )]);
+        app.state.search_query = "b".to_string();
+
+        app.handle_key(key_char('a'));
+
+        assert_eq!(app.state.search_query, "b");
+        assert_eq!(app.filtered_sessions().len(), 1);
     }
 
     // ── Quit ──────────────────────────────────────────────────────────────
@@ -1434,7 +1897,7 @@ mod tests {
                 title: "Session s1".to_string(),
                 key: SessionKey::claude("s1"),
             },
-            outcome: DeleteOutcome::Success(vec![project("/new", Vec::new())]),
+            outcome: DeleteOutcome::Success(vec![project("/new", vec![session("s2", "/new")])]),
         });
 
         assert!(app.state.delete_in_progress.is_none());
@@ -1500,8 +1963,10 @@ mod tests {
             }
         }
 
-        let app = StetsonApplication::new(ReloadingFakeRepository, FakeLauncher);
-        let mut stetson = Stetson::new(app);
+        let mut stetson = Stetson::new(vec![Box::new(TestBackend {
+            id: "claude",
+            repository: ReloadingFakeRepository,
+        })]);
         stetson.state.pending_resume = Some(ResumeTarget {
             key: SessionKey::claude("s1"),
             cwd: PathBuf::from("/"),

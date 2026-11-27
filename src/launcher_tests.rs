@@ -1,5 +1,6 @@
-use super::{ClaudeCliLauncher, ResumeLauncher, ResumeTarget, SessionKey};
+use super::{ClaudeBackend, ClaudeCliLauncher, ResumeLauncher, ResumeTarget, SessionKey};
 use cowboy::claude_env::{ClaudeEnvStore, Setting};
+use cowboy::infrastructure::ClaudeProjectsStore;
 use rusqlite::Connection;
 use std::{env, fs, path::PathBuf, process::Command};
 
@@ -57,6 +58,7 @@ fn main() {
     );
     let alias = root.join(format!("custom-claude{}", env::consts::EXE_SUFFIX));
     fs::copy(&fake, &alias).unwrap();
+    fs::copy(&fake, root.join(format!("pi{}", env::consts::EXE_SUFFIX))).unwrap();
     let path = env::join_paths(
         std::iter::once(root.to_path_buf()).chain(
             env::var_os("PATH")
@@ -68,6 +70,8 @@ fn main() {
 
     let mut mismatches = Vec::new();
     for (mode, executable, expected_args) in [
+        ("pi-new", "pi", &[][..]),
+        ("pi-resume", "pi", &["--session", "session-123"][..]),
         ("new", "custom-claude", &[][..]),
         ("resume", "claude", &["--resume", "session-123"][..]),
     ] {
@@ -126,11 +130,39 @@ fn run_launcher_probe() {
     };
     let store = ClaudeEnvStore::new(PathBuf::from(env::var_os("COWBOY_TEST_DB").unwrap()));
     let cwd = PathBuf::from(env::var_os("COWBOY_TEST_PROJECT").unwrap());
+    if mode.starts_with("pi-") {
+        use super::{AgentBackend, PiBackend, PiCliLauncher, SessionRepository};
+        let backend = PiBackend::new(cowboy::pi::PiProjectsStore::new(cwd.join("sessions")));
+        assert_eq!((backend.id().as_str(), backend.label()), ("pi", "Pi"));
+        assert!(backend.load_projects().unwrap().is_empty());
+        let target = ResumeTarget {
+            key: SessionKey::new(backend.id(), "session-123").unwrap(),
+            cwd,
+        };
+        let args = if mode == "pi-new" {
+            vec![]
+        } else {
+            vec!["--session", "session-123"]
+        };
+        assert_eq!(
+            PiCliLauncher::command(&target.cwd, &args).get_program(),
+            "pi"
+        );
+        if mode == "pi-new" {
+            backend.launch_new(&target.cwd).unwrap();
+        } else {
+            backend.resume(&target).unwrap();
+        }
+        return;
+    }
     let launcher = ClaudeCliLauncher::new(store);
+    // Launch through the backend strategy so the delegation to
+    // ClaudeCliLauncher is covered by this probe.
+    let backend = ClaudeBackend::new(ClaudeProjectsStore::new(cwd.join("projects")), launcher);
     if mode == "new" {
-        launcher.launch_new(&cwd).unwrap();
+        backend.launch_new(&cwd).unwrap();
     } else {
-        launcher
+        backend
             .resume(&ResumeTarget {
                 key: SessionKey::claude("session-123"),
                 cwd,

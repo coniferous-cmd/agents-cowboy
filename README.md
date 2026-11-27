@@ -1,12 +1,13 @@
 # cowboy
 
-`cowboy` is a Rust TUI for browsing and managing Claude Code sessions stored under `~/.claude/projects/`.
+`cowboy` is a Rust TUI for browsing and managing Claude Code and Pi sessions in separate agent tabs.
 
 The two-column browser fills the terminal from the top row: Projects on the left and Sessions on the right, with status and keyboard hints at the bottom. The focused pane's border is highlighted.
 
 ## Features
 
-- Browse projects and sessions from `~/.claude/projects/`
+- Browse Claude projects from `~/.claude/projects/` and Pi v3 sessions from `~/.pi/agent/sessions/`
+- Start Pi with `pi` or resume with `pi --session <session-id>` in the project's working directory
 - Resume an existing session with the configured launcher, defaulting to `claude --resume <session-id>`
 - Start a new Claude session in the selected project directory with the configured launcher
 - Rename sessions
@@ -18,7 +19,7 @@ The two-column browser fills the terminal from the top row: Projects on the left
 
 - Rust toolchain
 - `claude` available on your `PATH`, or a configured launcher alias available on your `PATH`
-- Existing Claude Code data under `~/.claude/`
+- For Pi launches, `pi` on your `PATH`. A missing Pi sessions directory simply leaves the Pi tab empty.
 
 ## Build and Run
 
@@ -97,7 +98,7 @@ whether the tag was created automatically or manually.
 | `r` | Rename session |
 | `Ctrl+D` | Delete project or session depending on focus; press `Ctrl+D` again in the confirmation dialog to confirm |
 | `/` | Search sessions |
-| `a` | Cycle the agent filter; the Sessions pane title shows it (`Sessions` = all agents, `Sessions · Claude` = Claude only) |
+| `a` | Cycle the agent tab (one tab per supported agent backend; exactly one is always selected, no `All`) |
 | `q` / `Esc` | Quit |
 
 After confirming a deletion, cowboy keeps rendering while the filesystem
@@ -194,5 +195,5 @@ If `settings.json` is a symlink to a legacy Profile file, **do not delete the ta
 ## Development Notes
 
 - The UI is keyboard-first and intentionally minimal.
-- `~/.claude` remains the source of truth for session data.
+- Each backend's local transcripts remain the source of truth for its sessions.
 - SQLite is metadata only.

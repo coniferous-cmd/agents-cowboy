@@ -92,6 +92,12 @@ impl SessionUsage {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReportedCost {
+    pub total: f64,
+    pub from_provider: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CostEstimate {
     pub input_cost: f64,
@@ -119,6 +125,7 @@ pub struct Session {
     pub usage: Option<SessionUsage>,
     pub model: Option<String>,
     pub estimated_cost: Option<CostEstimate>,
+    pub reported_cost: Option<ReportedCost>,
     pub capabilities: SessionCapabilities,
 }
 
@@ -306,6 +313,22 @@ pub fn validate_rename_title(input: &str) -> std::result::Result<String, &'stati
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn zero_reported_cost_retains_its_origin() {
+        let reported = super::ReportedCost {
+            total: 0.0,
+            from_provider: false,
+        };
+        assert_ne!(
+            reported,
+            super::ReportedCost {
+                from_provider: true,
+                ..reported
+            }
+        );
+        assert_ne!(Some(reported), None);
+    }
+
     use super::{
         group_sessions_by_project, project_display_names, validate_rename_title, AgentId, Project,
         Session, SessionCapabilities, SessionKey, SessionUsage,
@@ -327,6 +350,7 @@ mod tests {
                 usage: None,
                 model: None,
                 estimated_cost: None,
+                reported_cost: None,
                 capabilities: SessionCapabilities::default(),
             },
             Session {
@@ -341,6 +365,7 @@ mod tests {
                 usage: None,
                 model: None,
                 estimated_cost: None,
+                reported_cost: None,
                 capabilities: SessionCapabilities::default(),
             },
             Session {
@@ -355,6 +380,7 @@ mod tests {
                 usage: None,
                 model: None,
                 estimated_cost: None,
+                reported_cost: None,
                 capabilities: SessionCapabilities::default(),
             },
         ];
@@ -381,6 +407,7 @@ mod tests {
             usage: None,
             model: None,
             estimated_cost: None,
+            reported_cost: None,
             capabilities: SessionCapabilities::default(),
         };
         let codex = Session {
@@ -411,6 +438,7 @@ mod tests {
                 usage: None,
                 model: None,
                 estimated_cost: None,
+                reported_cost: None,
                 capabilities: SessionCapabilities::default(),
             },
             Session {
@@ -425,6 +453,7 @@ mod tests {
                 usage: None,
                 model: None,
                 estimated_cost: None,
+                reported_cost: None,
                 capabilities: SessionCapabilities::default(),
             },
             Session {
@@ -439,6 +468,7 @@ mod tests {
                 usage: None,
                 model: None,
                 estimated_cost: None,
+                reported_cost: None,
                 capabilities: SessionCapabilities::default(),
             },
         ];

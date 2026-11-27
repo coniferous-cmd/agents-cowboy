@@ -4,12 +4,12 @@ mod layout;
 use ratatui::{
     layout::Alignment,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs, Wrap},
     Frame,
 };
 
 use crate::{
-    app::{AgentFilter, AppState, FocusPane, ModalState},
+    app::{AgentTab, AppState, FocusPane, ModalState},
     application::{session_key, session_title},
 };
 use cowboy::features::project_usage::{build_project_row_label, summarize_project_usage};
@@ -25,6 +25,7 @@ const OPEN_HERE_PROJECT_LABEL: &str = "Open Here";
 pub fn render(frame: &mut Frame, state: &AppState) {
     let layout = compute_main_layout(frame.area());
 
+    render_agent_tabs(frame, state, layout.tabs);
     render_projects(frame, state, &layout);
     render_sessions(frame, state, &layout);
     render_status(frame, state, layout.status);
@@ -40,6 +41,22 @@ pub fn render(frame: &mut Frame, state: &AppState) {
         ModalState::DeleteConfirm => render_confirm_modal(frame, state),
         ModalState::None => {}
     }
+}
+
+/// The agent tab strip: one tab per registered strategy, exactly one
+/// selected. There is no `All` tab and no focus tab row.
+fn render_agent_tabs(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rect) {
+    let titles: Vec<Line> = state
+        .agent_tabs
+        .iter()
+        .map(|tab: &AgentTab| Line::from(tab.label.clone()))
+        .collect();
+    let tabs = Tabs::new(titles)
+        .select(Some(state.selected_agent))
+        .style(hint_text_style(&state.theme))
+        .highlight_style(status_badge_style(&state.theme))
+        .divider("|");
+    frame.render_widget(tabs, area);
 }
 
 fn render_projects(frame: &mut Frame, state: &AppState, layout: &MainLayout) {
@@ -77,7 +94,7 @@ fn render_sessions(frame: &mut Frame, state: &AppState, layout: &MainLayout) {
     let filtered_sessions = filter_project_sessions_for_agent(
         state.projects.get(state.selected_project),
         &state.search_query,
-        state.agent_filter.agent_id(),
+        state.selected_agent_id(),
     );
     let items = if filtered_sessions.is_empty() {
         vec![ListItem::new("No sessions")]
@@ -103,9 +120,13 @@ fn render_sessions(frame: &mut Frame, state: &AppState, layout: &MainLayout) {
                         meta_text_style(&state.theme),
                     ));
                 }
-                if let Some(cost) = &session.estimated_cost {
+                if let Some(total) = session
+                    .reported_cost
+                    .map(|c| c.total)
+                    .or_else(|| session.estimated_cost.as_ref().map(|c| c.total_cost()))
+                {
                     spans.push(Span::styled(
-                        format!("  ${:.2}", cost.total_cost()),
+                        format!("  ${total:.2}"),
                         meta_text_style(&state.theme),
                     ));
                 } else if let Some(usage) = &session.usage {
@@ -119,13 +140,9 @@ fn render_sessions(frame: &mut Frame, state: &AppState, layout: &MainLayout) {
             .collect()
     };
 
-    // The active agent filter lives in the pane title. "All" is the default
-    // and adds no suffix.
-    let agent_label = match &state.agent_filter {
-        AgentFilter::All => None,
-        AgentFilter::Agent(_) => Some(state.agent_filter.label()),
-    };
-    let title = sessions_panel_title(agent_label, &state.search_query);
+    // The tab strip is the single source of truth for the active agent; the
+    // title carries only the search query.
+    let title = sessions_panel_title(&state.search_query);
 
     let block = Block::default()
         .title(title)
@@ -324,7 +341,15 @@ fn render_info_modal(frame: &mut Frame, state: &AppState) {
         text.push(Line::from("Token Usage: Unknown"));
     }
 
-    if let Some(cost) = &info.estimated_cost {
+    if let Some(cost) = info.reported_cost {
+        text.push(Line::from(""));
+        text.push(Line::from(format!("Cost: ${:.4}", cost.total)));
+        text.push(Line::from(if cost.from_provider {
+            "  (reported by provider)"
+        } else {
+            "  (reported by pi)"
+        }));
+    } else if let Some(cost) = &info.estimated_cost {
         text.push(Line::from(""));
         text.push(Line::from(format!("Est. Cost: ${:.4}", cost.total_cost())));
         text.push(Line::from("  (estimate based on token usage)"));
@@ -452,6 +477,7 @@ mod tests {
                 usage: None,
                 model: None,
                 estimated_cost: None,
+                reported_cost: None,
                 capabilities: SessionCapabilities::default(),
             }],
         });
@@ -459,69 +485,136 @@ mod tests {
     }
 
     #[test]
-    fn top_row_shows_pane_borders_instead_of_focus_tabs() {
-        let state = state_with_one_claude_session();
+    fn reported_cost_precedes_estimate_in_row_and_details() {
+        for origin in [None, Some(true), Some(false)] {
+            let mut state = state_with_one_claude_session();
+            state.agent_tabs = vec![claude_tab()];
+            let s = &mut state.projects[0].sessions[0];
+            s.estimated_cost = Some(cowboy::CostEstimate {
+                input_cost: 2.,
+                output_cost: 0.,
+                cache_creation_cost: 0.,
+                cache_read_cost: 0.,
+            });
+            s.reported_cost = origin.map(|from_provider| cowboy::domain::ReportedCost {
+                total: 0.013308,
+                from_provider,
+            });
+            let row = render_to_lines(&state, 140, 70).join("\n");
+            assert!(row.contains(if origin.is_some() { "$0.01" } else { "$2.00" }));
+            let p = &state.projects[0];
+            state.info = Some(crate::app::build_session_info(p, &p.sessions[0]));
+            state.modal = ModalState::Info;
+            let text = render_to_lines(&state, 140, 70).join("\n");
+            let (cost, label) = match origin {
+                Some(true) => ("Cost: $0.0133", "(reported by provider)"),
+                Some(false) => ("Cost: $0.0133", "(reported by pi)"),
+                None => ("Est. Cost: $2.0000", "(estimate based on token usage)"),
+            };
+            assert!(text.contains(cost) && text.contains(label));
+        }
+    }
 
-        let lines = render_to_lines(&state, 80, 20);
-
-        assert!(lines[0].starts_with("┌Projects"), "row 0: {:?}", lines[0]);
-        // The default "All" filter adds no suffix: the title is immediately
-        // followed by the border fill.
-        assert!(lines[0].contains("┌Sessions─"), "row 0: {:?}", lines[0]);
+    fn codex_tab() -> crate::app::AgentTab {
+        crate::app::AgentTab {
+            id: AgentId::new("codex").unwrap(),
+            label: "Codex".to_string(),
+        }
     }
 
     #[test]
-    fn sessions_title_stays_plain_when_searching_without_an_agent_filter() {
+    fn panes_start_below_the_agent_tab_strip() {
         let mut state = state_with_one_claude_session();
-        state.search_query = "login".into();
+        state.agent_tabs = vec![claude_tab()];
 
         let lines = render_to_lines(&state, 80, 20);
 
-        assert!(
-            lines[0].contains("┌Sessions / login─"),
-            "row 0: {:?}",
-            lines[0]
-        );
+        assert!(lines[0].contains("Claude"), "row 0: {:?}", lines[0]);
+        assert!(lines[1].starts_with("┌Projects"), "row 1: {:?}", lines[1]);
+        assert!(lines[1].contains("┌Sessions─"), "row 1: {:?}", lines[1]);
     }
 
     #[test]
-    fn no_tab_strip_rows_are_rendered() {
-        let state = state_with_one_claude_session();
+    fn strip_shows_exactly_the_registered_tabs_without_all_or_focus_row() {
+        let mut state = state_with_one_claude_session();
+        state.agent_tabs = vec![claude_tab(), codex_tab()];
 
-        let screen = render_to_lines(&state, 80, 20).join("\n");
+        let lines = render_to_lines(&state, 80, 20);
+        let screen = lines.join("\n");
 
-        // ratatui's Tabs pads each label, so the strips read " Projects  |  Sessions ".
+        assert!(lines[0].contains("Claude"), "row 0: {:?}", lines[0]);
+        assert!(lines[0].contains("Codex"), "row 0: {:?}", lines[0]);
+        assert!(!lines[0].contains("All"), "row 0: {:?}", lines[0]);
+        // The removed focus tab row must not return.
         assert!(!screen.contains("Projects  |  Sessions"), "{screen}");
-        assert!(!screen.contains("All  |  Claude"), "{screen}");
     }
 
     #[test]
-    fn sessions_title_shows_the_active_agent_filter() {
+    fn selected_agent_tab_is_highlighted() {
         let mut state = state_with_one_claude_session();
-        state.agent_filter = AgentFilter::Agent(AgentId::new("claude").unwrap());
+        state.agent_tabs = vec![claude_tab(), codex_tab()];
+        state.selected_agent = 1;
 
-        let lines = render_to_lines(&state, 80, 20);
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row: String = (0..80).map(|x| buffer[(x, 0)].symbol()).collect();
+        let claude_x = row.find("Claude").expect("Claude tab rendered") as u16;
+        let codex_x = row.find("Codex").expect("Codex tab rendered") as u16;
 
-        assert!(
-            lines[0].contains("Sessions · Claude"),
-            "row 0: {:?}",
-            lines[0]
+        assert_ne!(
+            buffer[(claude_x, 0)].bg,
+            buffer[(codex_x, 0)].bg,
+            "selected tab must carry a distinct highlight"
         );
     }
 
     #[test]
-    fn sessions_title_shows_agent_filter_and_search_query() {
+    fn sessions_title_stays_plain_when_searching_without_agent_tabs() {
         let mut state = state_with_one_claude_session();
-        state.agent_filter = AgentFilter::Agent(AgentId::new("claude").unwrap());
         state.search_query = "login".into();
 
         let lines = render_to_lines(&state, 80, 20);
 
         assert!(
-            lines[0].contains("Sessions · Claude / login"),
-            "row 0: {:?}",
-            lines[0]
+            lines[1].contains("┌Sessions / login─"),
+            "row 1: {:?}",
+            lines[1]
         );
+    }
+
+    fn claude_tab() -> crate::app::AgentTab {
+        crate::app::AgentTab {
+            id: AgentId::new("claude").unwrap(),
+            label: "Claude".to_string(),
+        }
+    }
+
+    #[test]
+    fn sessions_title_has_no_agent_suffix_under_a_selected_tab() {
+        let mut state = state_with_one_claude_session();
+        state.agent_tabs = vec![claude_tab()];
+
+        let lines = render_to_lines(&state, 80, 20);
+
+        assert!(lines[1].contains("┌Sessions─"), "row 1: {:?}", lines[1]);
+        assert!(!lines[1].contains("· Claude"), "row 1: {:?}", lines[1]);
+    }
+
+    #[test]
+    fn sessions_title_shows_only_the_query_under_a_selected_tab() {
+        let mut state = state_with_one_claude_session();
+        state.agent_tabs = vec![claude_tab()];
+        state.search_query = "login".into();
+
+        let lines = render_to_lines(&state, 80, 20);
+
+        assert!(
+            lines[1].contains("┌Sessions / login─"),
+            "row 1: {:?}",
+            lines[1]
+        );
+        assert!(!lines[1].contains("· Claude"), "row 1: {:?}", lines[1]);
     }
 
     #[test]
