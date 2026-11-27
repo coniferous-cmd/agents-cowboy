@@ -3,22 +3,26 @@ version: 1
 description: "Spec-driven change workflow"
 artifacts:
   - id: proposal
+    description: Change motivation and scope
     generates: proposal.md
     template: proposal.md
     requires: []
   - id: specs
+    description: Observable behavior and acceptance scenarios
     generates: specs/**/*.md
-    template: specs/spec.md
+    template: specs.md
     requires: []
   - id: design
+    description: Technical approach and trade-offs
     generates: design.md
     template: design.md
     requires: []
   - id: tasks
+    description: Implementation and verification checklist
     generates: tasks.md
     template: tasks.md
     requires: []
-apply:
+implement:
   requires:
     - tasks
   tracks: tasks.md
