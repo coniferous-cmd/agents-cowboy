@@ -154,6 +154,10 @@ rather than making the entire project list unavailable.
 
 - Token accounting reads the `usage` payload already written to session JSONL.
 - cowboy does not re-tokenize transcript text.
+- Within each session, usage is deduplicated by request ID when present,
+  otherwise by message ID (or Pi message entry ID if neither is present). The
+  last valid usage record in file order wins, including its Pi reported cost.
+  Records without a usable ID are counted individually.
 - Session usage is aggregated before project usage is calculated.
 - Cost is an estimate derived from usage, model, and the embedded pricing table.
 - Missing usage or model data produces an unknown or token-only state rather

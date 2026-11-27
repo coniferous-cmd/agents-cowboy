@@ -1,7 +1,9 @@
 use crate::{
     domain::{AgentId, ReportedCost, SessionCapabilities, SessionKey},
     infrastructure::timestamps::TimestampRange,
-    pricing, Result, Session, SessionUsage, StetsonError,
+    pricing,
+    usage_records::{UsageKey, UsageRecords},
+    Result, Session, SessionUsage, StetsonError,
 };
 use serde_json::Value;
 use std::{
@@ -58,8 +60,7 @@ pub(super) fn parse(path: &Path) -> Result<Option<Session>> {
     let mut user = None;
     let mut seen_user = false;
     let mut model = None;
-    let mut usage = None;
-    let mut reported = None;
+    let mut usage_records = UsageRecords::new();
     for (i, line) in BufReader::new(File::open(path)?).lines().enumerate() {
         let line = line?;
         if line.trim().is_empty() {
@@ -113,31 +114,43 @@ pub(super) fn parse(path: &Path) -> Result<Option<Session>> {
                 if !u.is_object() {
                     continue;
                 }
-                let sum = usage.get_or_insert(SessionUsage {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cache_read_tokens: 0,
-                    cache_creation_tokens: 0,
-                });
                 let n = |k: &str| u[k].as_u64().unwrap_or(0);
-                sum.input_tokens += n("input");
-                sum.output_tokens += n("output");
-                sum.cache_read_tokens += n("cacheRead");
-                sum.cache_creation_tokens += n("cacheWrite");
+                let usage = SessionUsage {
+                    input_tokens: n("input"),
+                    output_tokens: n("output"),
+                    cache_read_tokens: n("cacheRead"),
+                    cache_creation_tokens: n("cacheWrite"),
+                };
                 let c = &u["cost"];
-                if let Some(total) = c["total"].as_f64() {
-                    let cost = reported.get_or_insert(ReportedCost {
-                        total: 0.,
-                        from_provider: true,
-                    });
-                    cost.total += total;
-                    cost.from_provider &= c["totalFromProvider"].as_bool() == Some(true);
-                }
+                let cost = c["total"].as_f64().map(|total| ReportedCost {
+                    total,
+                    from_provider: c["totalFromProvider"].as_bool() == Some(true),
+                });
+                usage_records.insert(UsageKey::from_pi_record(&v), (usage, cost));
             }
             _ => {}
         }
     }
     let (key, cwd) = key_cwd.ok_or_else(|| invalid(path, "missing session header"))?;
+    let mut usage = None;
+    let mut reported = None;
+    for (record, record_cost) in usage_records.into_records() {
+        let sum = usage.get_or_insert(SessionUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        });
+        sum.add(record);
+        if let Some(record_cost) = record_cost {
+            let cost = reported.get_or_insert(ReportedCost {
+                total: 0.,
+                from_provider: true,
+            });
+            cost.total += record_cost.total;
+            cost.from_provider &= record_cost.from_provider;
+        }
+    }
     let estimated_cost = usage
         .as_ref()
         .zip(model.as_deref())

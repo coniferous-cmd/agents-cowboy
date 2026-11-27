@@ -122,6 +122,61 @@ fn parse_v3_stream_and_group_by_header() {
     );
 }
 #[test]
+fn duplicate_usage_and_reported_cost_use_the_same_latest_snapshot() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let snapshot = |entry_id: &str, fields| {
+        let mut record = msg("assistant", fields);
+        record["id"] = json!(entry_id);
+        record
+    };
+    let anonymous = msg("assistant", json!({"usage":{"input":2}}));
+    put(
+        root,
+        "project",
+        "dedup",
+        &[
+            header("dedup", root),
+            snapshot(
+                "a",
+                json!({"requestId":"req","usage":{"input":100,"cost":{"total":9,"totalFromProvider":false}}}),
+            ),
+            snapshot(
+                "b",
+                json!({"requestId":"req","usage":{"input":10,"cost":{"total":0.5,"totalFromProvider":true}}}),
+            ),
+            snapshot("c", json!({"requestId":"req","usage":null})),
+            snapshot(
+                "d",
+                json!({"id":"message","usage":{"output":100,"cost":{"total":2,"totalFromProvider":false}}}),
+            ),
+            snapshot("e", json!({"id":"message","usage":{"output":3}})),
+            snapshot("entry", json!({"usage":{"cacheWrite":100}})),
+            snapshot(
+                "entry",
+                json!({"usage":{"cacheWrite":4,"cost":{"total":0.25,"totalFromProvider":true}}}),
+            ),
+            anonymous.clone(),
+            anonymous,
+        ],
+    );
+
+    let session = PiProjectsStore::new(root)
+        .discover_sessions()
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(session.message_count, Some(9));
+    let usage = session.usage.unwrap();
+    assert_eq!(usage.input_tokens, 14);
+    assert_eq!(usage.output_tokens, 3);
+    assert_eq!(usage.cache_creation_tokens, 4);
+    let cost = session.reported_cost.unwrap();
+    assert_eq!(cost.total, 0.75);
+    assert!(cost.from_provider);
+}
+
+#[test]
 fn title_usage_and_estimation_fallbacks() {
     let t = tempfile::tempdir().unwrap();
     let h = header("a", t.path());

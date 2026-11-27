@@ -1,5 +1,6 @@
 use crate::domain::{Result, Session, SessionCapabilities, SessionKey, SessionUsage, StetsonError};
 use crate::pricing;
+use crate::usage_records::{UsageKey, UsageRecords};
 use serde_json::Value;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -48,13 +49,7 @@ pub(super) fn parse_session_file(
     let mut git_branch = None;
     let mut ts_range = TimestampRange::new();
     let mut message_count = 0usize;
-    let mut usage = SessionUsage {
-        input_tokens: 0,
-        output_tokens: 0,
-        cache_creation_tokens: 0,
-        cache_read_tokens: 0,
-    };
-    let mut has_usage = false;
+    let mut usage_records = UsageRecords::new();
     let mut model: Option<String> = None;
 
     for (line_number, line) in contents.lines().enumerate() {
@@ -106,11 +101,7 @@ pub(super) fn parse_session_file(
         }
 
         if let Some(record_usage) = extract_usage(&value) {
-            usage.input_tokens += record_usage.input_tokens;
-            usage.output_tokens += record_usage.output_tokens;
-            usage.cache_creation_tokens += record_usage.cache_creation_tokens;
-            usage.cache_read_tokens += record_usage.cache_read_tokens;
-            has_usage = true;
+            usage_records.insert(UsageKey::from_record(&value), record_usage);
         }
         if model.is_none() {
             model = extract_model(&value);
@@ -126,7 +117,13 @@ pub(super) fn parse_session_file(
     let created_at = ts_range.created_at_string();
     let updated_at = ts_range.updated_at_string();
 
-    let usage = if has_usage { Some(usage) } else { None };
+    let usage = usage_records
+        .into_records()
+        .into_iter()
+        .reduce(|mut sum, record| {
+            sum.add(record);
+            sum
+        });
     let estimated_cost = match (&usage, &model) {
         (Some(u), Some(m)) => pricing::estimate_cost(u, m),
         _ => None,

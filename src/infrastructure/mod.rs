@@ -448,6 +448,59 @@ mod tests {
     }
 
     #[test]
+    fn usage_keeps_latest_valid_snapshot_per_request_or_message_in_each_session() {
+        let temp = tempdir().unwrap();
+        let project_dir = temp.path().join("-tmp-demo-repo");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("dedup.jsonl"),
+            [
+                r#"{"sessionId":"dedup","requestId":"shared","message":{"id":"old-message","usage":{"input_tokens":100,"output_tokens":1}}}"#,
+                r#"{"requestId":"shared","message":{"id":"msg","usage":{"input_tokens":10,"output_tokens":4,"cache_read_input_tokens":5}}}"#,
+                r#"{"requestId":"shared","message":{"id":"msg","usage":{}}}"#,
+                r#"{"requestId":"other","message":{"id":"msg","usage":{"output_tokens":8}}}"#,
+                r#"{"message":{"id":"shared","usage":{"output_tokens":90}}}"#,
+                r#"{"message":{"id":"shared","usage":{"output_tokens":3,"cache_creation_input_tokens":2}}}"#,
+                r#"{"requestId":" ","usage":{"input_tokens":1}}"#,
+                r#"{"uuid":"entry","usage":{"input_tokens":1}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        fs::write(
+            project_dir.join("another.jsonl"),
+            r#"{"requestId":"shared","usage":{"input_tokens":20}}"#,
+        )
+        .unwrap();
+
+        let sessions = ClaudeProjectsStore::new(temp.path())
+            .discover_sessions()
+            .unwrap();
+        let usage = sessions
+            .iter()
+            .find(|session| session.native_id() == "dedup")
+            .unwrap()
+            .usage
+            .as_ref()
+            .unwrap();
+        assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.output_tokens, 15);
+        assert_eq!(usage.cache_read_tokens, 5);
+        assert_eq!(usage.cache_creation_tokens, 2);
+        assert_eq!(
+            sessions
+                .iter()
+                .find(|session| session.native_id() == "another")
+                .unwrap()
+                .usage
+                .as_ref()
+                .unwrap()
+                .total_tokens(),
+            20
+        );
+    }
+
+    #[test]
     fn session_without_usage_has_none_fields() {
         let temp = tempdir().unwrap();
         let projects_root = temp.path().join(".claude/projects");

@@ -6,6 +6,7 @@ pub mod infrastructure;
 pub mod pi;
 pub mod pricing;
 pub mod theme;
+mod usage_records;
 
 pub use claude_env::{AtomicReplace, ClaudeEnvStore, Setting, Theme};
 pub use domain::{

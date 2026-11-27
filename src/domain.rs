@@ -88,6 +88,13 @@ pub struct SessionUsage {
 }
 
 impl SessionUsage {
+    pub(crate) fn add(&mut self, other: Self) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_creation_tokens += other.cache_creation_tokens;
+        self.cache_read_tokens += other.cache_read_tokens;
+    }
+
     pub fn total_tokens(&self) -> u64 {
         self.input_tokens + self.output_tokens + self.cache_creation_tokens + self.cache_read_tokens
     }
