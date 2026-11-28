@@ -9,22 +9,18 @@ pub(crate) enum UsageKey {
 }
 
 impl UsageKey {
-    pub(crate) fn from_record(record: &Value) -> Option<Self> {
-        let message = &record["message"];
-        let request_keys = ["requestId", "request_id"];
-        let message_keys = ["messageId", "message_id"];
-        find_id(record, &request_keys)
-            .or_else(|| find_id(message, &request_keys))
-            .map(|id| Self::Request(id.to_owned()))
-            .or_else(|| {
-                find_id(message, &["id", "messageId", "message_id"])
-                    .or_else(|| find_id(record, &message_keys))
-                    .map(|id| Self::Message(id.to_owned()))
-            })
+    pub(crate) fn from_message_id(record: &Value) -> Option<Self> {
+        find_id(&record["message"], &["id", "messageId", "message_id"])
+            .or_else(|| find_id(record, &["messageId", "message_id"]))
+            .map(|id| Self::Message(id.to_owned()))
     }
 
     pub(crate) fn from_pi_record(record: &Value) -> Option<Self> {
-        Self::from_record(record)
+        let keys = ["requestId", "request_id"];
+        find_id(record, &keys)
+            .or_else(|| find_id(&record["message"], &keys))
+            .map(|id| Self::Request(id.to_owned()))
+            .or_else(|| Self::from_message_id(record))
             .or_else(|| find_id(record, &["id"]).map(|id| Self::Entry(id.to_owned())))
     }
 }

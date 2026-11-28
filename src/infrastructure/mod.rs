@@ -448,7 +448,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_keeps_latest_valid_snapshot_per_request_or_message_in_each_session() {
+    fn claude_usage_keeps_latest_valid_snapshot_per_message_in_each_session() {
         let temp = tempdir().unwrap();
         let project_dir = temp.path().join("-tmp-demo-repo");
         fs::create_dir_all(&project_dir).unwrap();
@@ -461,7 +461,8 @@ mod tests {
                 r#"{"requestId":"other","message":{"id":"msg","usage":{"output_tokens":8}}}"#,
                 r#"{"message":{"id":"shared","usage":{"output_tokens":90}}}"#,
                 r#"{"message":{"id":"shared","usage":{"output_tokens":3,"cache_creation_input_tokens":2}}}"#,
-                r#"{"requestId":" ","usage":{"input_tokens":1}}"#,
+                r#"{"requestId":"shared","usage":{"input_tokens":2}}"#,
+                r#"{"requestId":"shared","usage":{"input_tokens":1}}"#,
                 r#"{"uuid":"entry","usage":{"input_tokens":1}}"#,
             ]
             .join("\n"),
@@ -469,7 +470,7 @@ mod tests {
         .unwrap();
         fs::write(
             project_dir.join("another.jsonl"),
-            r#"{"requestId":"shared","usage":{"input_tokens":20}}"#,
+            r#"{"sessionId":"another","message":{"id":"msg","usage":{"input_tokens":20}}}"#,
         )
         .unwrap();
 
@@ -483,9 +484,9 @@ mod tests {
             .usage
             .as_ref()
             .unwrap();
-        assert_eq!(usage.input_tokens, 12);
-        assert_eq!(usage.output_tokens, 15);
-        assert_eq!(usage.cache_read_tokens, 5);
+        assert_eq!(usage.input_tokens, 104);
+        assert_eq!(usage.output_tokens, 12);
+        assert_eq!(usage.cache_read_tokens, 0);
         assert_eq!(usage.cache_creation_tokens, 2);
         assert_eq!(
             sessions

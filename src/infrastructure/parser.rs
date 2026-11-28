@@ -101,7 +101,7 @@ pub(super) fn parse_session_file(
         }
 
         if let Some(record_usage) = extract_usage(&value) {
-            usage_records.insert(UsageKey::from_record(&value), record_usage);
+            usage_records.insert(UsageKey::from_message_id(&value), record_usage);
         }
         if model.is_none() {
             model = extract_model(&value);
